@@ -161,11 +161,20 @@ let state = {
   signedIn: false,
   busy: false
 };
-const save = () => {
+const save = (opts) => {
   DB.set('bookmarks', state.bookmarks);
   DB.set('watchlist', state.watchlist);
   DB.set('mode', state.mode);
+  if (!opts?.noSync) scheduleSync();
 };
+
+// Deletions need to travel too, otherwise the other device just puts the row back
+// on the next merge. A tombstone outranks any entry older than itself.
+function tombstone(id) {
+  const t = DB.get('tombstones', {});
+  t[id] = new Date().toISOString();
+  DB.set('tombstones', t);
+}
 
 /* ── Helpers ──────────────────────────────────────────────── */
 const clock = ms => {
@@ -322,6 +331,169 @@ function record(np) {
   save();
 }
 
+/* ── Gist sync ────────────────────────────────────────────────
+   Bookmarks live in a secret gist so phone and laptop share one list.
+   Needs a *classic* GitHub token with only the `gist` scope — fine-grained
+   tokens still can't touch the Gists API.
+   ──────────────────────────────────────────────────────────── */
+const GIST_FILE = 'contilisten.json';
+
+const GH = {
+  get token()  { return DB.get('ghToken'); },
+  set token(v) { v ? DB.set('ghToken', v) : DB.del('ghToken'); },
+  get gistId() { return DB.get('ghGist'); },
+  set gistId(v){ v ? DB.set('ghGist', v) : DB.del('ghGist'); },
+
+  async call(path, method = 'GET', body) {
+    const r = await fetch('https://api.github.com' + path, {
+      method,
+      headers: {
+        Authorization: 'Bearer ' + GH.token,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        ...(body ? { 'Content-Type': 'application/json' } : {})
+      },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    const text = await r.text();
+    const data = text ? JSON.parse(text) : null;
+    if (!r.ok) {
+      const e = new Error(data?.message || r.statusText);
+      e.status = r.status;
+      throw e;
+    }
+    return data;
+  }
+};
+
+const localPayload = () => ({
+  version: 1,
+  updatedAt: new Date().toISOString(),
+  mode: state.mode,
+  bookmarks: state.bookmarks,
+  watchlist: state.watchlist,
+  tombstones: DB.get('tombstones', {})
+});
+
+const t2n = s => new Date(s || 0).getTime();
+
+function mergePayload(remote, local) {
+  const tomb = {};
+  for (const k of new Set([...Object.keys(remote.tombstones || {}),
+                           ...Object.keys(local.tombstones || {})])) {
+    const a = remote.tombstones?.[k], b = local.tombstones?.[k];
+    tomb[k] = t2n(a) > t2n(b) ? a : b;
+  }
+  // Forget deletions after 90 days so the file doesn't grow forever.
+  const cutoff = Date.now() - 90 * 864e5;
+  for (const k of Object.keys(tomb)) if (t2n(tomb[k]) < cutoff) delete tomb[k];
+
+  const newest = (list, stamp) => {
+    const m = new Map();
+    for (const x of list) {
+      const prev = m.get(x.id);
+      if (!prev || t2n(x[stamp]) > t2n(prev[stamp])) m.set(x.id, x);
+    }
+    return [...m.values()];
+  };
+
+  const bookmarks = newest([...(remote.bookmarks || []), ...(local.bookmarks || [])], 'updatedAt')
+    .filter(b => !(tomb[b.id] && t2n(tomb[b.id]) >= t2n(b.updatedAt)))
+    .sort((a, b) => t2n(b.updatedAt) - t2n(a.updatedAt));
+
+  const watchlist = newest([...(remote.watchlist || []), ...(local.watchlist || [])], 'addedAt')
+    .filter(w => !(tomb[w.id] && t2n(tomb[w.id]) >= t2n(w.addedAt)));
+
+  const mode = t2n(remote.updatedAt) > t2n(local.updatedAt)
+    ? (remote.mode || local.mode) : local.mode;
+
+  return { version: 1, updatedAt: new Date().toISOString(), mode, bookmarks, watchlist, tombstones: tomb };
+}
+
+/// Second device only needs the token — this finds the gist the first one made.
+async function findGist() {
+  const gists = await GH.call('/gists?per_page=100');
+  const hit = (gists || []).find(g => g.files && g.files[GIST_FILE]);
+  return hit ? hit.id : null;
+}
+
+let syncTimer = null, syncing = false;
+
+function scheduleSync() {
+  if (!GH.token) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => sync(), 6000);   // debounce; poll writes often
+}
+
+async function sync(manual) {
+  if (!GH.token || syncing) return;
+  syncing = true;
+  if (manual) render();
+  try {
+    if (!GH.gistId) GH.gistId = await findGist();
+
+    let remote = {};
+    if (GH.gistId) {
+      const gist = await GH.call('/gists/' + GH.gistId);
+      const file = gist.files?.[GIST_FILE];
+      if (file) {
+        const content = file.truncated ? await (await fetch(file.raw_url)).text() : file.content;
+        remote = JSON.parse(content || '{}');
+      }
+    }
+
+    const merged = mergePayload(remote, localPayload());
+    state.bookmarks = merged.bookmarks;
+    state.watchlist = merged.watchlist;
+    state.mode = merged.mode || state.mode;
+    DB.set('tombstones', merged.tombstones);
+    save({ noSync: true });
+
+    const body = { files: { [GIST_FILE]: { content: JSON.stringify(merged, null, 2) } } };
+    if (GH.gistId) {
+      await GH.call('/gists/' + GH.gistId, 'PATCH', body);
+    } else {
+      const created = await GH.call('/gists', 'POST',
+        { description: 'ContiListen bookmarks', public: false, ...body });
+      GH.gistId = created.id;
+    }
+
+    DB.set('lastSync', new Date().toISOString());
+    render();
+    if (manual) toast('Synced');
+  } catch (e) {
+    if (e.status === 401) toast('GitHub token rejected — check it in Settings.', true);
+    else if (e.status === 403) toast('Token lacks the gist scope.', true);
+    else if (manual) toast('Sync failed: ' + e.message, true);
+  } finally {
+    syncing = false;
+    if (manual) render();
+  }
+}
+
+async function connectGist(token) {
+  GH.token = token.trim();
+  GH.gistId = null;
+  try {
+    const me = await GH.call('/user');
+    toast('Connected as ' + me.login);
+    await sync(true);
+    openSettings();
+  } catch (e) {
+    GH.token = null;
+    toast(e.status === 401 ? 'That token was rejected.' : e.message, true);
+    openSettings();
+  }
+}
+
+function disconnectGist() {
+  GH.token = null;
+  GH.gistId = null;
+  DB.del('lastSync');
+  toast('Sync turned off. Bookmarks stay on this device.');
+  openSettings();
+}
+
 /* ── Player ───────────────────────────────────────────────── */
 async function poll() {
   if (!state.signedIn) return;
@@ -437,7 +609,10 @@ function startPolling() {
 }
 function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') poll();
+  if (document.visibilityState !== 'visible') return;
+  poll();
+  // Another device may have moved a bookmark while this tab was hidden.
+  if (GH.token) sync();
 });
 
 /* ── Render ───────────────────────────────────────────────── */
@@ -506,6 +681,7 @@ function render() {
 }
 
 function removeBookmark(i) {
+  tombstone(state.bookmarks[i].id);
   state.bookmarks.splice(i, 1);
   save(); render();
 }
@@ -519,21 +695,56 @@ function openSheet(title) {
 function closeSheet() { sheet().close(); render(); }
 
 function openSettings() {
+  const last = DB.get('lastSync');
+  const on = !!GH.token;
   openSheet('Settings');
   document.getElementById('sheetBody').innerHTML = `
-    <h2 style="margin-top:0">Remember</h2>
+    <h2 style="margin-top:0">Sync across devices</h2>
+    ${on ? `
+      <div class="card"><div class="row" style="cursor:default">
+        <div class="art">☁️</div>
+        <div class="meta">
+          <div class="t1">Gist sync is on</div>
+          <div class="t2">${last ? 'Last synced ' + ago(last) : 'Not synced yet'}</div>
+        </div>
+      </div></div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="ghost" style="flex:1" onclick="sync(true)">${syncing ? 'Syncing…' : 'Sync now'}</button>
+        <button class="ghost" style="flex:1" onclick="disconnectGist()">Disconnect</button>
+      </div>
+      ${GH.gistId ? `<p class="hint">Stored in secret gist
+        <a href="https://gist.github.com/${esc(GH.gistId)}" target="_blank"
+           style="color:var(--accent)">${esc(GH.gistId.slice(0, 8))}…</a></p>` : ''}
+    ` : `
+      <p class="hint">Bookmarks are stored per browser. Connect a GitHub token and they'll
+         live in a secret gist instead — shared by every device you paste the same token into.</p>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <input type="text" id="ghtok" placeholder="ghp_… classic token"
+               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+        <button class="ghost" onclick="connectGist(document.getElementById('ghtok').value)">Connect</button>
+      </div>
+      <p class="hint">Create one at <b>github.com → Settings → Developer settings →
+         Personal access tokens → Tokens (classic)</b>, ticking <b>only</b> the
+         <b>gist</b> scope. Fine-grained tokens can't reach the Gists API.</p>
+    `}
+
+    <h2>Remember</h2>
     <div class="seg">
       <button class="${state.mode === 'everything' ? 'on' : ''}" onclick="setMode('everything')">Everything I play</button>
       <button class="${state.mode === 'watchlist' ? 'on' : ''}" onclick="setMode('watchlist')">Watchlist only</button>
     </div>
     <p class="hint">${state.mode === 'watchlist'
       ? 'Only artists, albums and keywords on your watchlist get bookmarked.'
-      : 'Every album you play gets a bookmark. Swipe-free: tap ✕ on a row to forget it.'}</p>
+      : 'Every album you play gets a bookmark. Tap ✕ on a row to forget it.'}</p>
+
     <h2>Storage</h2>
     <p class="hint">${DB.ok
-      ? 'Bookmarks live in this browser only. iOS clears site data after about 7 days of not visiting, so open this page now and then — or add it to your Home Screen.'
+      ? (on
+        ? 'Also in your gist, so a Safari data purge is recoverable — reconnect and it pulls everything back.'
+        : 'Bookmarks live in this browser only. iOS clears site data after about 7 days of not visiting.')
       : 'Private browsing blocks storage, so bookmarks will vanish when you close this tab.'}</p>
-    <div style="margin-top:22px"><button class="primary" style="background:#3a1f1f;color:#ffb4b4" onclick="signOut();closeSheet()">Sign out</button></div>`;
+
+    <div style="margin-top:22px"><button class="primary" style="background:#3a1f1f;color:#ffb4b4" onclick="signOut();closeSheet()">Sign out of Spotify</button></div>`;
 }
 function setMode(m) { state.mode = m; save(); openSettings(); }
 
@@ -695,17 +906,23 @@ async function runSearch() {
 
 function addWatch(r) {
   if (!state.watchlist.some(w => w.uri === r.uri)) {
-    state.watchlist.unshift({ kind: r.kind, id: r.id, uri: r.uri, name: r.name, art: r.art });
+    state.watchlist.unshift({ kind: r.kind, id: r.uri, uri: r.uri, name: r.name,
+                              art: r.art, spotifyId: r.id, addedAt: new Date().toISOString() });
     save();
   }
   runSearch();
 }
-function removeWatch(i) { state.watchlist.splice(i, 1); save(); drawWatchlist(); }
+function removeWatch(i) {
+  tombstone(state.watchlist[i].id);
+  state.watchlist.splice(i, 1);
+  save(); drawWatchlist();
+}
 function addKeyword() {
   const el = document.getElementById('kw');
   const t = el.value.trim();
   if (t.length < 2) return;
-  state.watchlist.unshift({ kind: 'keyword', id: 'kw:' + t.toLowerCase(), uri: null, name: t, art: null });
+  state.watchlist.unshift({ kind: 'keyword', id: 'kw:' + t.toLowerCase(), uri: null,
+                            name: t, art: null, addedAt: new Date().toISOString() });
   save(); el.value = ''; drawWatchlist();
 }
 
@@ -721,7 +938,8 @@ let browse = { artist: null, items: [], offset: 0, done: false };
 
 async function browseArtist(i) {
   const w = state.watchlist[i];
-  browse = { artist: w, items: [], offset: 0, done: false };
+  browse = { artist: { ...w, id: w.spotifyId || w.id.split(':').pop() },
+             items: [], offset: 0, done: false };
   openSheet(w.name);
   document.getElementById('sheetBody').innerHTML = '<div class="center">Loading…</div>';
   await loadEpisodes();
@@ -777,6 +995,7 @@ function openEpisode(i) {
   state.signedIn = !!DB.get('refresh');
   render();
   if (state.signedIn) { startPolling(); reconcile(); }
+  if (GH.token) sync();
 })();
 </script>
 </body>
