@@ -97,6 +97,15 @@
   .seg button.on{background:var(--surface-2);color:var(--text);border-color:var(--accent)}
   .hint{color:var(--dim);font-size:12.5px;margin:9px 2px 0;line-height:1.5}
   .center{display:flex;justify-content:center;padding:16px}
+
+  .target{
+    display:flex;align-items:center;gap:9px;background:var(--surface);
+    border:1px solid var(--line);border-radius:11px;padding:10px 13px;
+    font-size:13px;color:var(--dim);cursor:pointer;margin-bottom:4px
+  }
+  .target b{color:var(--text);font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .target .edit{color:var(--accent);font-weight:600}
+  .target:active{background:var(--surface-2)}
 </style>
 </head>
 <body>
@@ -117,10 +126,10 @@
    The redirect URI is this page's own URL; register it verbatim
    in the Spotify dashboard.
    ════════════════════════════════════════════════════════════ */
-const CLIENT_ID = 'fcac2f6154a841bb8ac819f12823e994';
+const CLIENT_ID = 'fcac2f6154a841bb8ac819f12823e994'
 
 const REDIRECT_URI = location.origin + location.pathname;
-const SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing';
+const SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing user-read-recently-played';
 const API = 'https://api.spotify.com';
 
 /* ── Storage ──────────────────────────────────────────────── */
@@ -335,41 +344,67 @@ async function poll() {
   }
 }
 
-async function pickDevice() {
-  const d = await api('/v1/me/player/devices');
-  const list = (d?.devices || []).filter(x => x.id);
-  if (!list.length) return null;
-  const last = DB.get('lastDevice');
-  const target = list.find(x => x.is_active)
-    || list.find(x => x.id === last)
-    || list.find(x => x.type === 'Smartphone')
-    || list[0];
-  if (!target.is_active) {
-    try {
-      await api('/v1/me/player', 'PUT', { device_ids: [target.id], play: false });
-      await new Promise(r => setTimeout(r, 600));
-    } catch (e) {}
+/* ── Devices ──────────────────────────────────────────────── */
+const DEVICE_ICON = {
+  Computer:'💻', Smartphone:'📱', Tablet:'📱', Speaker:'🔊', TV:'📺', AVR:'🎛',
+  STB:'📺', AudioDongle:'🔌', GameConsole:'🎮', CastVideo:'📺', CastAudio:'🔊',
+  Automobile:'🚗'
+};
+const deviceIcon = t => DEVICE_ICON[t] || '🎵';
+
+// Things in another room. Never auto-selected, even when Spotify calls them active —
+// an idle Echo stays "active" for hours after you stop using it.
+const FAR = new Set(['Speaker','CastAudio','CastVideo','TV','AVR','STB','GameConsole','AudioDongle']);
+
+const listDevices = async () =>
+  ((await api('/v1/me/player/devices'))?.devices || []).filter(x => x.id);
+
+function rank(d) {
+  const far = FAR.has(d.type);
+  if (d.is_active && !far) return 0;
+  if (d.type === 'Smartphone' || d.type === 'Tablet') return 1;
+  if (d.type === 'Computer') return 2;
+  if (d.is_active) return 3;
+  return 4;
+}
+
+async function resolveDevice() {
+  const list = await listDevices();
+  const pinned = DB.get('pinnedDevice');
+  if (pinned) {
+    const hit = list.find(x => x.id === pinned.id);
+    if (hit) return { device: hit };
+    return { device: null, reason: 'offline', pinned };
   }
-  DB.set('lastDevice', target.id);
-  return target.id;
+  if (!list.length) return { device: null, reason: 'empty' };
+  return { device: [...list].sort((a, b) => rank(a) - rank(b))[0] };
 }
 
 async function startPlayback(payload, label) {
   if (state.busy) return;
   state.busy = true; render();
   try {
-    const dev = await pickDevice();
-    if (!dev) {
-      toast('No Spotify device. Opening Spotify — come back and tap again.', true);
+    const r = await resolveDevice();
+    if (!r.device) {
+      toast(r.reason === 'offline'
+        ? `${r.pinned.name} isn't awake. Opening Spotify there — then tap again.`
+        : 'No Spotify device found. Opening Spotify — then tap again.', true);
       location.href = 'spotify:';
       return;
     }
-    await api('/v1/me/player/play?device_id=' + dev, 'PUT', payload);
-    toast('Continuing ' + label);
+    if (!r.device.is_active) {
+      try {
+        await api('/v1/me/player', 'PUT', { device_ids: [r.device.id], play: false });
+        await new Promise(res => setTimeout(res, 600));
+      } catch (e) {}
+    }
+    await api('/v1/me/player/play?device_id=' + r.device.id, 'PUT', payload);
+    DB.set('lastDevice', r.device.id);
+    toast(`Continuing ${label} on ${r.device.name}`);
     setTimeout(poll, 1200);
   } catch (e) {
     if (e.status === 404) {
-      toast('No active device. Opening Spotify — then tap again.', true);
+      toast('Device went away. Opening Spotify — then tap again.', true);
       location.href = 'spotify:';
     } else if (e.status === 403) {
       toast('Spotify Premium is required to control playback.', true);
@@ -452,12 +487,18 @@ function render() {
     </div>`).join('')
     : `<div class="empty"><b>Nothing saved yet</b>Play an episode in Spotify, then come back to this page.</div>`;
 
+  const pinned = DB.get('pinnedDevice');
+  const target = pinned ? `📱 ${esc(pinned.name)}` : '✨ Automatic';
+
   app.innerHTML = `
     <header>
       <h1>ContiListen</h1>
       <button class="iconbtn" onclick="openWatchlist()" title="Watchlist">★</button>
       <button class="iconbtn" onclick="openSettings()" title="Settings">⋯</button>
     </header>
+    <div class="target" onclick="openDevices()">
+      <span>Plays on</span><b>${target}</b><span class="edit">Change</span>
+    </div>
     ${nowHTML}
     <h2>Continue</h2>
     <div class="card">${list}</div>
@@ -495,6 +536,93 @@ function openSettings() {
     <div style="margin-top:22px"><button class="primary" style="background:#3a1f1f;color:#ffb4b4" onclick="signOut();closeSheet()">Sign out</button></div>`;
 }
 function setMode(m) { state.mode = m; save(); openSettings(); }
+
+/* ── Device picker ────────────────────────────────────────── */
+async function openDevices() {
+  openSheet('Play on');
+  document.getElementById('sheetBody').innerHTML = '<div class="center">Looking for devices…</div>';
+  try { drawDevices(await listDevices()); }
+  catch (e) { drawDevices([]); toast(e.message, true); }
+}
+
+function drawDevices(list) {
+  const pinned = DB.get('pinnedDevice');
+  const rows = list.map(d => {
+    const on = pinned && pinned.id === d.id;
+    return `<div class="row" onclick="pinDevice('${d.id}','${esc(d.name).replace(/'/g,"&#39;")}')">
+      <div class="art">${deviceIcon(d.type)}</div>
+      <div class="meta">
+        <div class="t1">${esc(d.name)}</div>
+        <div class="t2">${esc(d.type)}${d.is_active ? ' · active now' : ''}</div>
+      </div>
+      ${on ? '<span class="tick">✓</span>' : ''}
+    </div>`;
+  }).join('');
+
+  document.getElementById('sheetBody').innerHTML = `
+    <div class="card">
+      <div class="row" onclick="clearPin()">
+        <div class="art">✨</div>
+        <div class="meta">
+          <div class="t1">Automatic</div>
+          <div class="t2">Prefers a phone or computer over a speaker</div>
+        </div>
+        ${!pinned ? '<span class="tick">✓</span>' : ''}
+      </div>
+    </div>
+    <h2>Your devices</h2>
+    <div class="card">${rows || `<div class="empty"><b>Nothing awake</b>
+      Spotify only lists a device while its app is open or recently used.</div>`}</div>
+    <div class="center" style="gap:8px">
+      <button class="ghost" onclick="openDevices()">Refresh</button>
+      <button class="ghost" onclick="location.href='spotify:'">Open Spotify here</button>
+    </div>
+    <p class="hint">Pinning a device makes every resume go there. If it's asleep the app
+       will offer to wake Spotify instead of quietly picking something in another room.</p>`;
+}
+
+function pinDevice(id, name) {
+  DB.set('pinnedDevice', { id, name });
+  toast('Playback will go to ' + name);
+  openDevices();
+}
+function clearPin() { DB.del('pinnedDevice'); toast('Back to automatic'); openDevices(); }
+
+/* ── Stale bookmark recovery ──────────────────────────────── */
+// Spotify returns 204 from /me/player once it goes idle, so a position listened to
+// hours ago is unreadable. recently-played still lists chapters that finished, which
+// at least reveals the bookmark is behind. We advance it to the start of the last
+// chapter Spotify saw finish — a few minutes of replay rather than an hour lost.
+async function reconcile() {
+  try {
+    const items = (await api('/v1/me/player/recently-played?limit=50'))?.items || [];
+    if (!items.length) return;
+    let changed = false;
+
+    for (const b of state.bookmarks) {
+      const key = b.contextURI || b.id;
+      const plays = items.filter(it =>
+        (it.context?.uri === key || it.track?.album?.uri === key) &&
+        new Date(it.played_at) > new Date(b.updatedAt));
+      if (!plays.length) continue;
+
+      const newest = plays.reduce((a, x) =>
+        new Date(x.played_at) > new Date(a.played_at) ? x : a);
+      b.trackURI    = newest.track.uri;
+      b.trackName   = newest.track.name;
+      b.trackNumber = newest.track.track_number;
+      b.durationMs  = newest.track.duration_ms;
+      b.positionMs  = 0;
+      b.updatedAt   = newest.played_at;
+      changed = true;
+    }
+    if (changed) {
+      state.bookmarks.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+      save(); render();
+      toast('Caught up from Spotify history');
+    }
+  } catch (e) { /* scope may be missing until you sign in again */ }
+}
 
 /* ── Watchlist ────────────────────────────────────────────── */
 let searchTimer;
@@ -648,7 +776,7 @@ function openEpisode(i) {
   await handleRedirect();
   state.signedIn = !!DB.get('refresh');
   render();
-  if (state.signedIn) startPolling();
+  if (state.signedIn) { startPolling(); reconcile(); }
 })();
 </script>
 </body>
