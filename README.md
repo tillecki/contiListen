@@ -1,161 +1,189 @@
-# ContiListen — web version
+# ContiListen
 
-One HTML file. No build step, no backend, no home server. Everything runs in the
-browser: OAuth via PKCE (which is why no client secret is needed), and the Spotify
-Web API for reading and setting playback position.
+Bookmarks your position in Spotify Hörspiele (*Die drei ???*, *Sherlock Holmes*) and
+resumes exactly where you stopped. Spotify only does this for podcasts, not for
+albums.
 
-Works on a locked-down work iPhone, because nothing gets installed — it's a web page
-you add to the Home Screen.
+A web page, so nothing gets installed — it works on a locked-down work phone.
 
-## What carries over, what doesn't
-
-**Kept:** bookmark-per-Hörspiel, resume in album context so playback rolls on into the
-next chapter, watchlist with artist/album/keyword, browsable episode list per followed
-artist, "remember everything" vs "watchlist only".
-
-**Lost, unavoidably:**
-
-| | |
-|---|---|
-| Home Screen widget | Web pages can't provide widgets. |
-| Siri / Shortcuts | Needs a native App Intent. |
-| Background position capture | A web page only runs while open. Position is read every 5s while the tab is visible, and once whenever you reopen it. |
-
-That last one matters less than it sounds. Spotify keeps reporting the last player
-state for a while after you stop, so opening the page after a listening session
-usually catches the right position anyway — same as the native app in practice.
-
-## Requirements
-
-- **Spotify Premium.** The Web API refuses playback control on Free accounts.
-- **A Spotify app registration** (free) for the Client ID.
-- **The Spotify app running somewhere** — phone, desktop, or web player. The page
-  sends commands to a device; it isn't a player itself.
+**You need:** Spotify Premium, a GitHub account, and the Spotify app open on some
+device when you press play.
 
 ---
 
-## Route A — GitHub Pages (needed for the iPhone)
+# Part 1 — Get it working
 
-Spotify requires an HTTPS redirect URI, so the page has to be hosted. GitHub Pages
-is free and takes about five minutes.
+About 10 minutes. Do all five steps.
 
-### 1. Put the file on GitHub
+## 1. Create a Spotify app
 
-1. Create a GitHub account if you don't have one.
-2. **New repository** → name it `contilisten` → **Public** → Create.
-3. On the repo page: **Add file** → **Upload files** → drag in `index.html` →
-   **Commit changes**.
+Go to <https://developer.spotify.com/dashboard> → **Create app**.
 
-Public only affects the source, which contains no secrets — PKCE has none, and your
-tokens live in your own browser. Private repos need a paid plan for Pages.
+- Name: anything
+- Redirect URI: leave blank for now
+- APIs used: tick **Web API**
 
-### 2. Turn on Pages
+Click into the app → **Settings** → copy the **Client ID**. Keep the tab open.
 
-**Settings** → **Pages** (left sidebar) → Source: **Deploy from a branch** →
-Branch: `main`, folder `/ (root)` → **Save**.
+## 2. Put the files on GitHub
 
-Wait a minute, reload, and the URL appears at the top:
+1. Create a **new repository** called `contilisten`. Make it **Public**.
+2. **Add file → Upload files** → drag in `index.html` and `sw.js` → **Commit**.
+3. **Settings → Pages** → Source: *Deploy from a branch* → Branch `main`, folder
+   `/ (root)` → **Save**.
+
+Wait a minute and reload. Your address appears at the top:
 
 ```
 https://YOURNAME.github.io/contilisten/
 ```
 
-Copy it exactly, including the trailing slash.
+Copy it, including the trailing slash.
 
-### 3. Register that URL with Spotify
+## 3. Register that address with Spotify
 
-<https://developer.spotify.com/dashboard> → your app → **Settings** → **Edit** →
-under Redirect URIs add your Pages URL verbatim. Save.
+Back in the Spotify tab: **Settings → Edit** → under **Redirect URIs** paste your
+Pages address exactly → **Add** → **Save**.
 
-Spotify matches protocol, host, port and path exactly. A missing trailing slash is a
-different URI as far as it's concerned.
+It must match character for character. A missing trailing slash counts as different.
 
-### 4. Add your Client ID
+## 4. Add your Client ID
 
-Edit `index.html` on GitHub (open the file → pencil icon), find line ~120:
+On GitHub, open `index.html` → pencil icon → find this near the top:
 
 ```js
 const CLIENT_ID = 'PASTE_YOUR_SPOTIFY_CLIENT_ID';
 ```
 
-Paste the Client ID from the dashboard between the quotes. Commit. Pages redeploys in
-under a minute.
+Paste your Client ID between the quotes. **Commit changes.** Wait a minute.
 
-You don't set the redirect URI in the file — it uses the page's own address, so it
-stays correct wherever you host it.
+## 5. Open it on your phone
 
-### 5. Use it on the iPhone
+1. Open your Pages address in **Safari** (must be Safari, not Chrome).
+2. Tap **Connect Spotify** and approve.
+3. Share button → **Add to Home Screen**.
 
-1. Open the Pages URL in **Safari** (not Chrome — Home Screen apps only work from Safari).
-2. Tap **Connect Spotify**, approve the three scopes.
-3. Share button → **Add to Home Screen**. It gets an icon and opens without browser chrome.
-
-If sign-in bounces you into Safari and back oddly from the Home Screen version, sign
-in from a normal Safari tab first, then add to Home Screen.
+Done. Play something in Spotify, then open ContiListen — it appears under
+**Continue**. Tap it to resume.
 
 ---
 
-## Route B — straight off your computer, no hosting
+# Part 2 — Sync your phone and laptop
 
-For desktop-only use you can skip GitHub. Loopback addresses are the one case where
-Spotify permits HTTP.
+Optional, 5 minutes. Without this, each browser keeps its own separate list.
 
-Put `index.html` in a folder and run:
+1. Go to <https://github.com/settings/tokens> → **Tokens (classic)** →
+   **Generate new token (classic)**.
+2. Note: `contilisten`. Expiration: *No expiration*.
+3. Tick **only** the `gist` checkbox. Nothing else.
+4. **Generate token** and copy it (starts with `ghp_`).
+5. In ContiListen: **⋯ → Connect**, paste, tap **Connect**.
+
+On your other devices, paste the same token. They find each other automatically.
+
+> Must be a *classic* token. Fine-grained tokens can't access gists.
+
+---
+
+# Part 3 — Record position while the app is closed
+
+Optional, 15 minutes. Without this, your position is only saved while ContiListen is
+open. With it, a job runs every 5 minutes and saves your position even when nothing
+is open.
+
+## 1. Get your client secret
+
+Spotify dashboard → your app → **Settings** → **View client secret** → copy it.
+
+On the same page, **Edit** and add a second redirect URI:
+
+```
+http://127.0.0.1:8080/callback
+```
+
+## 2. Run the setup script once, on your computer
+
+Download `scripts/bootstrap_token.py`, then:
 
 ```bash
-cd /path/to/folder
-python3 -m http.server 8080 --bind 127.0.0.1
+export SPOTIFY_CLIENT_ID=your_client_id
+export SPOTIFY_CLIENT_SECRET=your_client_secret
+python3 bootstrap_token.py
 ```
 
-Register this redirect URI in the Spotify dashboard — the numeric form, not `localhost`,
-which Spotify stopped accepting in February 2025:
+Your browser opens, you approve, and the terminal prints a long token. Copy it.
 
-```
-http://127.0.0.1:8080/
-```
+## 3. Upload the job files
 
-Then open <http://127.0.0.1:8080/> in your browser.
+Upload to your repo, keeping the folder structure:
 
-This only works on the machine running the command. Your phone can't reach it, which
-is why the iPhone needs Route A.
+- `scripts/poll.py`
+- `.github/workflows/poller.yml`
+
+## 4. Add the secrets
+
+Repo → **Settings → Secrets and variables → Actions → New repository secret**.
+Add these four:
+
+| Name | Value |
+|---|---|
+| `SPOTIFY_CLIENT_ID` | from the dashboard |
+| `SPOTIFY_CLIENT_SECRET` | from the dashboard |
+| `SPOTIFY_REFRESH_TOKEN` | printed by the script |
+| `GIST_TOKEN` | the same `ghp_` token from Part 2 |
+
+## 5. Start it
+
+Play something in Spotify. Then repo → **Actions** tab → **ContiListen position
+poller** → **Run workflow**. Open the run and check the log — it prints what it saw.
+
+From now on it runs by itself every 5 minutes.
+
+> **Keep the repo public.** Private repos only get 2,000 free Action minutes a month
+> and this would exceed that. Your secrets stay encrypted either way.
+>
+> GitHub switches off scheduled jobs after 60 days of no repo activity and emails
+> you. One click in the Actions tab restarts it.
 
 ---
 
-## Using it from a computer
+# Using it
 
-Worth knowing: **the web version controls any of your Spotify devices**, not just the
-one it's running on. Open the page on your laptop and tap an episode, and it resumes
-on whichever device is active — including your phone, if Spotify is open there.
+**Continue** — tap any row to resume. It starts 15 seconds early so you don't come
+back mid-sentence (change under **⋯ → Rewind on resume**).
 
-The app picks a device in this order: whatever's currently active → the last device it
-used → any phone → anything else. If nothing is awake it opens Spotify and asks you to
-tap again.
+**👤 chip** — switch between listeners. Each profile keeps its own bookmarks, so you
+and your partner won't overwrite each other in the same series.
 
-So a realistic pattern: bookmark gets written while you listen on the phone, and next
-morning you continue from the laptop, or vice versa. The bookmarks aren't synced
-between browsers though — see below.
+**🔈 chip** — choose where playback goes. Pin your phone here if you're tired of
+audio landing on the kitchen speaker. Speakers are never picked automatically.
 
-## Things to know
+**★ button** — follow an artist and get their full episode list, so you can start any
+episode straight from the app. Or add an album, or a keyword.
 
-- **Bookmarks live in one browser.** They're in `localStorage`, per-browser and
-  per-device. Your phone and laptop keep separate lists. Syncing would need a server.
-- **iOS clears unused site data after about 7 days.** Open the page at least weekly, or
-  keep it on the Home Screen and use it — normal use resets the clock. This is Safari's
-  storage policy, not a bug.
-- **Private browsing loses everything** on tab close. The app detects this and says so
-  in Settings.
-- **Development Mode allows five users**, each added manually under Dashboard → your
-  app → Settings → User Management, and the app owner needs Premium. Add your
-  partner's Spotify email there or their calls will return 403.
-- **Rate limits** are computed over a rolling 30-second window. The page polls every 5s
-  only while visible, which is well inside them, but don't leave it open all day.
+**⋯ on a row** — Continue, **Jump back to earlier**, Mark as finished, Forget.
 
-## If something misbehaves
+**Jump back to earlier** is the fell-asleep fix. Positions are saved as breadcrumbs
+while you listen, so if you doze off in chapter 12 and Spotify runs on to chapter 40,
+you can pick "22:35 · Chapter 12" and carry on from there.
 
-| Symptom | Cause |
+Episodes past 97% move themselves into a collapsed **Finished** list.
+
+---
+
+# If something goes wrong
+
+| What you see | Fix |
 |---|---|
-| `INVALID_CLIENT: Invalid redirect URI` | Pages URL and dashboard entry don't match exactly. Check the trailing slash. |
-| Sign-in loops back to the start | Client ID still says `PASTE_...`, or the wrong one was pasted. |
-| "Spotify Premium is required" | Free account, or the wrong Spotify account was authorised. |
-| Everything 403s | Your Spotify account isn't on the app's User Management allowlist. |
-| Bookmarks vanished | Safari cleared site data after a week of not opening it. |
+| `INVALID_CLIENT: Invalid redirect URI` | Pages address and Spotify redirect URI don't match. Check the trailing slash. |
+| Sign-in loops back to the start | `CLIENT_ID` in `index.html` is still the placeholder. |
+| "Spotify Premium is required" | Free account, or you authorised the wrong Spotify account. |
+| Everything fails with 403 | Your Spotify account isn't on the app's allowlist. Dashboard → Settings → **User Management** → add the email. Development mode allows five people. |
+| "No Spotify device found" | Spotify isn't open anywhere. Tap **Open Spotify here** in the 🔈 menu, then try again. |
+| Playback goes to the wrong speaker | Pin the right device via the 🔈 chip. |
+| Bookmarks disappeared | Safari clears site data after ~7 days of not visiting. Set up Part 2 and it's recoverable. |
+| GitHub token rejected | Must be a classic token with the `gist` scope. Fine-grained tokens don't work. |
+
+**Position is up to 5 minutes behind** if you use Part 3, because that's GitHub's
+minimum schedule and runs are often later. Without Part 3, position only saves while
+the app is open.

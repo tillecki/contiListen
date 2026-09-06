@@ -30,7 +30,7 @@
   header h1{font-size:19px;font-weight:650;letter-spacing:-.02em;margin:0;flex:1}
   .iconbtn{
     background:var(--surface-2);border:1px solid var(--line);color:var(--text);
-    width:38px;height:38px;border-radius:11px;font-size:17px;display:grid;place-items:center;cursor:pointer
+    width:44px;height:44px;border-radius:12px;font-size:18px;display:grid;place-items:center;cursor:pointer
   }
   .iconbtn:active{background:#243029}
 
@@ -49,6 +49,19 @@
   .bar{height:3px;background:var(--surface-2);border-radius:2px;margin-top:7px;overflow:hidden}
   .bar>i{display:block;height:100%;background:var(--accent);border-radius:2px}
   .chev{color:var(--accent);font-size:22px;flex:none}
+  .more{
+    background:none;border:none;color:var(--dim);font-size:19px;cursor:pointer;
+    width:44px;height:44px;flex:none;border-radius:11px;display:grid;place-items:center
+  }
+  .more:active{background:var(--surface-2);color:var(--text)}
+  .dimmed{opacity:.55}
+  h2 .count{float:right;letter-spacing:0;text-transform:none;font-weight:500}
+  .chips{display:flex;gap:8px;margin-bottom:6px}
+  .chip{flex:1;min-width:0;display:flex;align-items:center;gap:7px;background:var(--surface);
+    border:1px solid var(--line);border-radius:11px;padding:0 12px;min-height:44px;
+    font-size:12.5px;color:var(--dim);cursor:pointer}
+  .chip b{color:var(--text);font-weight:600;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .chip:active{background:var(--surface-2)}
 
   .empty{padding:26px 18px;text-align:center;color:var(--dim);font-size:14px}
   .empty b{display:block;color:var(--text);font-size:15px;margin-bottom:6px}
@@ -59,7 +72,7 @@
   }
   button.primary:active{filter:brightness(.9)}
   button.ghost{background:var(--surface-2);border:1px solid var(--line);color:var(--text);
-    border-radius:10px;padding:9px 14px;font-size:13.5px;font-weight:600;cursor:pointer}
+    border-radius:11px;padding:0 18px;min-height:44px;font-size:14.5px;font-weight:600;cursor:pointer}
 
   .signin{text-align:center;padding:56px 20px}
   .signin .mark{font-size:52px;margin-bottom:18px}
@@ -74,6 +87,9 @@
   }
   .toast.on{opacity:1}
   .toast.warn{border-color:#5a4a1e;color:#f2d98d}
+  .toast{display:flex;align-items:center;gap:14px}
+  .toast .undo{background:none;border:none;color:var(--accent);font-weight:700;
+    font-size:14px;cursor:pointer;padding:6px 2px;flex:none}
 
   dialog{
     border:none;padding:0;background:var(--bg);color:var(--text);width:100%;max-width:620px;
@@ -81,7 +97,13 @@
   }
   dialog::backdrop{background:#000c}
   .sheet{display:flex;flex-direction:column;height:100dvh}
-  .sheethead{display:flex;gap:10px;align-items:center;padding:14px;border-bottom:1px solid var(--line)}
+  .sheethead{display:flex;gap:10px;align-items:center;padding:4px 14px 14px;border-bottom:1px solid var(--line)}
+  .grabber{padding:10px 0 6px;display:grid;place-items:center;touch-action:none;cursor:grab}
+  .grabber::after{content:"";width:38px;height:5px;border-radius:3px;background:var(--line);display:block}
+  .sheetfoot{
+    padding:10px 14px calc(10px + env(safe-area-inset-bottom));
+    border-top:1px solid var(--line);background:var(--bg)
+  }
   .sheethead h3{margin:0;font-size:17px;flex:1;letter-spacing:-.01em}
   .sheetbody{flex:1;overflow-y:auto;padding:14px;-webkit-overflow-scrolling:touch}
   input[type=search],input[type=text]{
@@ -113,11 +135,10 @@
 <div class="toast" id="toast"></div>
 
 <dialog id="sheet"><div class="sheet">
-  <div class="sheethead">
-    <h3 id="sheetTitle">Watchlist</h3>
-    <button class="ghost" onclick="closeSheet()">Done</button>
-  </div>
+  <div class="grabber" id="grabber"></div>
+  <div class="sheethead"><h3 id="sheetTitle">Watchlist</h3></div>
   <div class="sheetbody" id="sheetBody"></div>
+  <div class="sheetfoot"><button class="primary" onclick="closeSheet()">Done</button></div>
 </div></dialog>
 
 <script>
@@ -153,18 +174,44 @@ const DB = (() => {
   };
 })();
 
+const ARCHIVE_AT = 0.97;          // album fraction that counts as finished
+const HISTORY_CAP = 24;
+const HISTORY_GAP_MS = 4 * 60 * 1000;
+
 let state = {
   bookmarks: DB.get('bookmarks', []),
   watchlist: DB.get('watchlist', []),
   mode:      DB.get('mode', 'everything'),
+  profiles:  DB.get('profiles', ['Me']),
+  profile:   DB.get('profile', 'Me'),   // per-device, deliberately not synced
   nowPlaying: null,
   signedIn: false,
-  busy: false
+  busy: false,
+  showArchived: false
 };
+
+/* Bookmarks used to be keyed by album URI alone. Profiles need the owner in the
+   key, so anything predating them is adopted by the current profile. */
+(function migrate() {
+  let touched = false;
+  for (const b of state.bookmarks) {
+    if (!b.profile) {
+      b.profile = state.profile;
+      b.key = b.id;
+      b.id = b.profile + '::' + b.key;
+      b.history = b.history || [];
+      b.archived = !!b.archived;
+      touched = true;
+    }
+  }
+  if (touched) DB.set('bookmarks', state.bookmarks);
+})();
 const save = (opts) => {
   DB.set('bookmarks', state.bookmarks);
   DB.set('watchlist', state.watchlist);
   DB.set('mode', state.mode);
+  DB.set('profiles', state.profiles);
+  DB.set('profile', state.profile);
   if (!opts?.noSync) scheduleSync();
 };
 
@@ -190,16 +237,28 @@ const ago = iso => {
   if (d < 86400) return Math.round(d / 3600) + 'h ago';
   return Math.round(d / 86400) + 'd ago';
 };
+const wallClock = iso => new Date(iso)
+  .toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const dayLabel = iso => {
+  const d = new Date(iso), t = new Date();
+  if (d.toDateString() === t.toDateString()) return 'Today';
+  if (new Date(t - 864e5).toDateString() === d.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString([], { day: 'numeric', month: 'short' });
+};
+const t2n = s => new Date(s || 0).getTime();
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 let toastTimer;
-function toast(msg, warn) {
+function toast(msg, warn, action) {
   const el = document.getElementById('toast');
-  el.textContent = msg;
+  el.innerHTML = `<span>${esc(msg)}</span>` +
+    (action ? `<button class="undo">${esc(action.label)}</button>` : '');
+  if (action) el.querySelector('.undo').onclick = () => { el.className = 'toast'; action.run(); };
   el.className = 'toast on' + (warn ? ' warn' : '');
+  el.style.pointerEvents = action ? 'auto' : 'none';
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.className = 'toast', 3600);
+  toastTimer = setTimeout(() => el.className = 'toast', action ? 7000 : 3600);
 }
 
 /* ── PKCE auth ────────────────────────────────────────────── */
@@ -310,25 +369,126 @@ function watchMatches(np) {
   });
 }
 
+/** A rolling trail of positions, so an accidental all-night playthrough is undoable. */
+function pushHistory(history, entry) {
+  const list = [...(history || [])];
+  const sample = { t: entry.updatedAt, p: entry.positionMs, u: entry.trackURI, n: entry.trackNumber };
+  const last = list[list.length - 1];
+  if (last && last.u === sample.u && t2n(sample.t) - t2n(last.t) < HISTORY_GAP_MS) {
+    list[list.length - 1] = sample;      // same chapter, recent: replace
+  } else {
+    list.push(sample);
+  }
+  return list.slice(-HISTORY_CAP);
+}
+
 function record(np) {
   if (state.mode === 'watchlist' && !watchMatches(np)) return;
-  const id = np.contextURI || np.albumURI || np.trackURI;
-  const entry = { id, albumName: np.albumName, artistName: np.artistName, art: np.art,
+  const key = np.contextURI || np.albumURI || np.trackURI;
+  const id = state.profile + '::' + key;
+  const tomb = DB.get('tombstones', {});
+
+  const entry = { id, profile: state.profile, key,
+                  albumName: np.albumName, artistName: np.artistName, art: np.art,
                   contextURI: np.contextURI, trackURI: np.trackURI, trackName: np.trackName,
                   trackNumber: np.trackNumber, positionMs: np.positionMs,
-                  durationMs: np.durationMs, updatedAt: new Date().toISOString() };
+                  durationMs: np.durationMs, updatedAt: new Date().toISOString(),
+                  archived: false, history: [] };
+
   const i = state.bookmarks.findIndex(b => b.id === id);
   if (i >= 0) {
     const old = state.bookmarks[i];
     // Don't let a fresh restart at 0:01 clobber a good position.
     if (old.trackURI === entry.trackURI && entry.positionMs < 3000 && old.positionMs > 10000) return;
+    // Don't resurrect something deleted on another device.
+    if (tomb[id] && t2n(tomb[id]) >= t2n(old.updatedAt)) return;
+    entry.history = pushHistory(old.history, entry);
     state.bookmarks[i] = entry;
   } else {
     if (np.positionMs < 3000 && !np.isPlaying) return;
+    entry.history = pushHistory([], entry);
     state.bookmarks.push(entry);
   }
-  state.bookmarks.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  state.bookmarks.sort((a, b) => t2n(b.updatedAt) - t2n(a.updatedAt));
   save();
+}
+
+/** Only the current profile's bookmarks. */
+const mine = () => state.bookmarks.filter(b => (b.profile || 'Me') === state.profile);
+
+/* ── Album track maps ─────────────────────────────────────────
+   A 40-track Hörspiel needs its full track list before "how far in
+   am I" means anything. Albums never change, so this is cached
+   locally forever and never synced.
+   ──────────────────────────────────────────────────────────── */
+const albumCache = () => DB.get('albums', {});
+let albumFetching = false;
+
+async function fetchAlbum(uri) {
+  if (!uri || !uri.startsWith('spotify:album:')) return null;
+  const cache = albumCache();
+  if (cache[uri]) return cache[uri];
+
+  const id = uri.split(':').pop();
+  const tracks = {};
+  let total = 0, offset = 0, count = 0;
+
+  while (offset < 400) {
+    const page = await api(`/v1/albums/${id}/tracks?limit=50&offset=${offset}`);
+    const items = page?.items || [];
+    for (const t of items) {
+      tracks[t.uri] = { o: total, i: t.track_number ?? (count + 1) };
+      total += t.duration_ms || 0;
+      count++;
+    }
+    if (items.length < 50) break;
+    offset += 50;
+  }
+  if (!count) return null;
+
+  cache[uri] = { totalMs: total, tracks, count, at: Date.now() };
+  DB.set('albums', cache);
+  return cache[uri];
+}
+
+/** Album-level progress, or null while the track map is still unknown. */
+function progressOf(b) {
+  const meta = albumCache()[b.contextURI || ''];
+  const hit = meta?.tracks?.[b.trackURI];
+  if (!meta?.totalMs || !hit) return null;
+  const elapsed = hit.o + b.positionMs;
+  return { elapsed, total: meta.totalMs,
+           fraction: Math.min(1, elapsed / meta.totalMs),
+           chapter: hit.i, chapters: meta.count };
+}
+
+/** Pulls missing track maps a few at a time, then re-renders. */
+async function warmAlbums() {
+  if (albumFetching) return;
+  const cache = albumCache();
+  const missing = state.bookmarks
+    .filter(b => b.contextURI?.startsWith('spotify:album:') && !cache[b.contextURI])
+    .slice(0, 3);
+  if (!missing.length) return;
+
+  albumFetching = true;
+  for (const b of missing) {
+    try { await fetchAlbum(b.contextURI); } catch (e) { break; }
+  }
+  albumFetching = false;
+  autoArchive();
+  render();
+}
+
+/** Anything effectively finished drops out of the main list on its own. */
+function autoArchive() {
+  let changed = false;
+  for (const b of state.bookmarks) {
+    if (b.archived) continue;
+    const p = progressOf(b);
+    if (p && p.fraction >= ARCHIVE_AT) { b.archived = true; changed = true; }
+  }
+  if (changed) save();
 }
 
 /* ── Gist sync ────────────────────────────────────────────────
@@ -367,15 +527,14 @@ const GH = {
 };
 
 const localPayload = () => ({
-  version: 1,
+  version: 2,
   updatedAt: new Date().toISOString(),
   mode: state.mode,
+  profiles: state.profiles,
   bookmarks: state.bookmarks,
   watchlist: state.watchlist,
   tombstones: DB.get('tombstones', {})
 });
-
-const t2n = s => new Date(s || 0).getTime();
 
 function mergePayload(remote, local) {
   const tomb = {};
@@ -397,17 +556,28 @@ function mergePayload(remote, local) {
     return [...m.values()];
   };
 
-  const bookmarks = newest([...(remote.bookmarks || []), ...(local.bookmarks || [])], 'updatedAt')
+  const everyBookmark = [...(remote.bookmarks || []), ...(local.bookmarks || [])];
+  // Newest wins for position, but keep whichever copy has the longer breadcrumb
+  // trail — two devices sampling independently both hold real history.
+  const bookmarks = newest(everyBookmark, 'updatedAt')
+    .map(b => {
+      const longest = everyBookmark
+        .filter(x => x.id === b.id)
+        .reduce((acc, x) => (x.history?.length || 0) > acc.length ? x.history : acc, b.history || []);
+      return { ...b, history: (longest || []).slice(-HISTORY_CAP) };
+    })
     .filter(b => !(tomb[b.id] && t2n(tomb[b.id]) >= t2n(b.updatedAt)))
     .sort((a, b) => t2n(b.updatedAt) - t2n(a.updatedAt));
 
   const watchlist = newest([...(remote.watchlist || []), ...(local.watchlist || [])], 'addedAt')
     .filter(w => !(tomb[w.id] && t2n(tomb[w.id]) >= t2n(w.addedAt)));
 
-  const mode = t2n(remote.updatedAt) > t2n(local.updatedAt)
-    ? (remote.mode || local.mode) : local.mode;
+  const remoteNewer = t2n(remote.updatedAt) > t2n(local.updatedAt);
+  const profiles = [...new Set([...(remote.profiles || []), ...(local.profiles || []), 'Me'])];
 
-  return { version: 1, updatedAt: new Date().toISOString(), mode, bookmarks, watchlist, tombstones: tomb };
+  return { version: 2, updatedAt: new Date().toISOString(),
+           mode: remoteNewer ? (remote.mode || local.mode) : local.mode,
+           profiles, bookmarks, watchlist, tombstones: tomb };
 }
 
 /// Second device only needs the token — this finds the gist the first one made.
@@ -446,6 +616,7 @@ async function sync(manual) {
     state.bookmarks = merged.bookmarks;
     state.watchlist = merged.watchlist;
     state.mode = merged.mode || state.mode;
+    state.profiles = merged.profiles;
     DB.set('tombstones', merged.tombstones);
     save({ noSync: true });
 
@@ -459,6 +630,7 @@ async function sync(manual) {
     }
 
     DB.set('lastSync', new Date().toISOString());
+    autoArchive();
     render();
     if (manual) toast('Synced');
   } catch (e) {
@@ -511,6 +683,7 @@ async function poll() {
     };
     record(state.nowPlaying);
     render();
+    warmAlbums();
   } catch (e) {
     if (e.message === 'NOT_SIGNED_IN') { state.signedIn = false; render(); }
   }
@@ -588,12 +761,19 @@ async function startPlayback(payload, label) {
   }
 }
 
-const resume = b => startPlayback(
-  b.contextURI
-    ? { context_uri: b.contextURI, offset: { uri: b.trackURI }, position_ms: b.positionMs }
-    : { uris: [b.trackURI], position_ms: b.positionMs },
-  b.albumName
-);
+// Dropping back a few seconds re-establishes context — you've usually forgotten
+// the last sentence by the time you come back to it.
+const resume = b => {
+  const pos = Math.max(0, b.positionMs - DB.get('rewindSec', 15) * 1000);
+  return startPlayback(
+    b.contextURI
+      ? { context_uri: b.contextURI, offset: { uri: b.trackURI }, position_ms: pos }
+      : { uris: [b.trackURI], position_ms: pos },
+    b.albumName
+  );
+};
+const byId = id => state.bookmarks.find(b => b.id === id);
+const resumeById = id => { const b = byId(id); if (b) resume(b); };
 
 const playAlbum = (uri, name) => startPlayback({ context_uri: uri, position_ms: 0 }, name);
 
@@ -620,6 +800,30 @@ function artHTML(url, cls) {
   return url
     ? `<img class="art ${cls||''}" src="${esc(url)}" alt="" loading="lazy">`
     : `<div class="art ${cls||''}">♪</div>`;
+}
+
+/** One saved Hörspiel. Album progress when the track map is known, chapter progress
+    while it's still loading. */
+function bookmarkRow(b) {
+  const p = progressOf(b);
+  const pct = p ? p.fraction : (b.durationMs ? b.positionMs / b.durationMs : 0);
+  const line2 = p
+    ? `Chapter ${p.chapter} of ${p.chapters} · ${esc(b.trackName)}`
+    : (b.trackNumber ? `Track ${b.trackNumber} · ` : '') + esc(b.trackName);
+  const times = p ? `${clock(p.elapsed)} / ${clock(p.total)}`
+                  : `${clock(b.positionMs)} / ${clock(b.durationMs)}`;
+
+  return `<div class="row ${b.archived ? 'dimmed' : ''}" onclick="resumeById('${esc(b.id)}')">
+    ${artHTML(b.art)}
+    <div class="meta">
+      <div class="t1">${esc(b.albumName)}</div>
+      <div class="t2">${line2}</div>
+      <div class="bar"><i style="width:${Math.round(pct * 100)}%"></i></div>
+      <div class="t3"><span>${times}</span><span>${ago(b.updatedAt)}</span></div>
+    </div>
+    <button class="more" onclick="event.stopPropagation();openBookmark('${esc(b.id)}')"
+            aria-label="Options">⋯</button>
+  </div>`;
 }
 
 function render() {
@@ -649,21 +853,14 @@ function render() {
       <div class="chev">${np.isPlaying ? '▶' : '⏸'}</div>
     </div></div>` : '';
 
-  const list = state.bookmarks.length ? state.bookmarks.map((b, i) => `
-    <div class="row" onclick="resume(state.bookmarks[${i}])">
-      ${artHTML(b.art)}
-      <div class="meta">
-        <div class="t1">${esc(b.albumName)}</div>
-        <div class="t2">${b.trackNumber ? 'Track ' + b.trackNumber + ' · ' : ''}${esc(b.trackName)}</div>
-        <div class="bar"><i style="width:${Math.round((b.positionMs / (b.durationMs || 1)) * 100)}%"></i></div>
-        <div class="t3"><span>${clock(b.positionMs)} / ${clock(b.durationMs)}</span><span>${ago(b.updatedAt)}</span></div>
-      </div>
-      <div class="chev" onclick="event.stopPropagation();removeBookmark(${i})" style="color:var(--dim)">✕</div>
-    </div>`).join('')
+  const all = mine();
+  const active = all.filter(b => !b.archived);
+  const finished = all.filter(b => b.archived);
+
+  const list = active.length ? active.map(bookmarkRow).join('')
     : `<div class="empty"><b>Nothing saved yet</b>Play an episode in Spotify, then come back to this page.</div>`;
 
   const pinned = DB.get('pinnedDevice');
-  const target = pinned ? `📱 ${esc(pinned.name)}` : '✨ Automatic';
 
   app.innerHTML = `
     <header>
@@ -671,19 +868,208 @@ function render() {
       <button class="iconbtn" onclick="openWatchlist()" title="Watchlist">★</button>
       <button class="iconbtn" onclick="openSettings()" title="Settings">⋯</button>
     </header>
-    <div class="target" onclick="openDevices()">
-      <span>Plays on</span><b>${target}</b><span class="edit">Change</span>
+    <div class="chips">
+      <div class="chip" onclick="openProfiles()">👤 <b>${esc(state.profile)}</b></div>
+      <div class="chip" onclick="openDevices()">🔈 <b>${pinned ? esc(pinned.name) : 'Automatic'}</b></div>
     </div>
     ${nowHTML}
     <h2>Continue</h2>
     <div class="card">${list}</div>
+    ${finished.length ? `
+      <h2 onclick="state.showArchived=!state.showArchived;render()" style="cursor:pointer">
+        Finished <span class="count">${finished.length} ${state.showArchived ? '▾' : '▸'}</span>
+      </h2>
+      ${state.showArchived ? `<div class="card">${finished.map(bookmarkRow).join('')}</div>` : ''}
+    ` : ''}
     ${state.busy ? '<div class="center">working…</div>' : ''}`;
+
+  warmAlbums();
 }
 
-function removeBookmark(i) {
-  tombstone(state.bookmarks[i].id);
+function untombstone(id) {
+  const t = DB.get('tombstones', {});
+  delete t[id];
+  DB.set('tombstones', t);
+}
+
+/* ── Per-bookmark actions ─────────────────────────────────── */
+function openBookmark(id) {
+  const b = byId(id);
+  if (!b) return;
+  const p = progressOf(b);
+  const n = (b.history || []).length;
+  openSheet(b.albumName);
+  document.getElementById('sheetBody').innerHTML = `
+    <div class="card"><div class="row" style="cursor:default">
+      ${artHTML(b.art)}
+      <div class="meta">
+        <div class="t1">${esc(b.albumName)}</div>
+        <div class="t2">${esc(b.artistName)}</div>
+        <div class="t3"><span>${p ? `Chapter ${p.chapter} of ${p.chapters}` : esc(b.trackName)}</span>
+          <span>${clock(b.positionMs)}</span></div>
+      </div>
+    </div></div>
+
+    <h2>Actions</h2>
+    <div class="card">
+      <div class="row" onclick="closeSheet();resumeById('${esc(b.id)}')">
+        <div class="art">▶</div>
+        <div class="meta"><div class="t1">Continue</div>
+          <div class="t2">From ${clock(b.positionMs)}</div></div>
+      </div>
+      <div class="row" onclick="openHistory('${esc(b.id)}')">
+        <div class="art">⟲</div>
+        <div class="meta"><div class="t1">Jump back to earlier</div>
+          <div class="t2">${n} saved position${n === 1 ? '' : 's'}</div></div>
+      </div>
+      <div class="row" onclick="toggleArchive('${esc(b.id)}')">
+        <div class="art">${b.archived ? '↩' : '✓'}</div>
+        <div class="meta"><div class="t1">${b.archived ? 'Move back to Continue' : 'Mark as finished'}</div>
+          <div class="t2">${b.archived ? 'Un-archive this one' : 'Hide it in the Finished list'}</div></div>
+      </div>
+      <div class="row" onclick="forget('${esc(b.id)}')">
+        <div class="art">✕</div>
+        <div class="meta"><div class="t1" style="color:#ffb4b4">Forget</div>
+          <div class="t2">Removes the bookmark on every device</div></div>
+      </div>
+    </div>`;
+}
+
+function toggleArchive(id) {
+  const b = byId(id);
+  if (!b) return;
+  b.archived = !b.archived;
+  b.updatedAt = new Date().toISOString();
+  save(); closeSheet();
+  toast(b.archived ? 'Moved to Finished' : 'Back in Continue');
+}
+
+function forget(id) {
+  const i = state.bookmarks.findIndex(b => b.id === id);
+  if (i < 0) return;
+  const gone = state.bookmarks[i];
+  tombstone(gone.id);
   state.bookmarks.splice(i, 1);
-  save(); render();
+  save(); closeSheet();
+  toast('Forgot ' + gone.albumName, false, { label: 'Undo', run() {
+    untombstone(gone.id);
+    // Re-stamp so the restore outranks the tombstone on other devices.
+    gone.updatedAt = new Date().toISOString();
+    state.bookmarks.unshift(gone);
+    save(); render();
+  }});
+}
+
+/* ── Position history ─────────────────────────────────────────
+   The fell-asleep fix. Every poll leaves a breadcrumb, so an
+   accidental all-night playthrough is recoverable.
+   ──────────────────────────────────────────────────────────── */
+function openHistory(id) {
+  const b = byId(id);
+  if (!b) return;
+  openSheet('Jump back');
+
+  const hist = [...(b.history || [])].reverse();
+  const rows = hist.map((h, i) => `
+    <div class="row" onclick="jumpBack('${esc(b.id)}',${i})">
+      <div class="art" style="font-size:13px;font-weight:600">${esc(wallClock(h.t))}</div>
+      <div class="meta">
+        <div class="t1">${h.n ? 'Chapter ' + h.n : 'Earlier position'}</div>
+        <div class="t2">${esc(dayLabel(h.t))} · ${clock(h.p)} into the chapter</div>
+      </div>
+      <div class="chev">▶</div>
+    </div>`).join('');
+
+  document.getElementById('sheetBody').innerHTML = `
+    <p class="hint" style="margin-top:0">Positions recorded while you were listening,
+       newest first. Fell asleep? Pick where you actually were.</p>
+    <div class="card">${rows || `<div class="empty"><b>No history yet</b>
+      Positions get saved as you listen.</div>`}</div>`;
+}
+
+function jumpBack(id, index) {
+  const b = byId(id);
+  if (!b) return;
+  const h = [...(b.history || [])].reverse()[index];
+  if (!h) return;
+
+  const previous = { ...b };
+  b.trackURI = h.u;
+  b.trackNumber = h.n;
+  b.positionMs = h.p;
+  b.updatedAt = new Date().toISOString();
+  b.archived = false;
+  save();
+  closeSheet();
+  resume(b);
+
+  toast('Jumped back to ' + wallClock(h.t), false, { label: 'Undo', run() {
+    Object.assign(b, previous, { updatedAt: new Date().toISOString() });
+    save(); render();
+  }});
+}
+
+/* ── Profiles ─────────────────────────────────────────────── */
+function openProfiles() {
+  openSheet('Who is listening');
+  const rows = state.profiles.map(name => {
+    const count = state.bookmarks.filter(b => (b.profile || 'Me') === name).length;
+    const safe = esc(name).replace(/'/g, '&#39;');
+    return `<div class="row" onclick="pickProfile('${safe}')">
+      <div class="art">👤</div>
+      <div class="meta"><div class="t1">${esc(name)}</div>
+        <div class="t2">${count} bookmark${count === 1 ? '' : 's'}</div></div>
+      ${name === state.profile ? '<span class="tick">✓</span>'
+        : (state.profiles.length > 1
+          ? `<button class="more" onclick="event.stopPropagation();deleteProfile('${safe}')">✕</button>`
+          : '')}
+    </div>`;
+  }).join('');
+
+  document.getElementById('sheetBody').innerHTML = `
+    <div class="card">${rows}</div>
+    <h2>Add someone</h2>
+    <div style="display:flex;gap:8px">
+      <input type="text" id="pname" placeholder="e.g. Anna">
+      <button class="ghost" onclick="addProfile()">Add</button>
+    </div>
+    <p class="hint">Each profile keeps its own bookmarks, so you don't overwrite each other
+       in the same series. Which profile is active is remembered per device, so your phone
+       and your partner's can differ while still sharing one gist.</p>`;
+}
+
+function pickProfile(name) {
+  state.profile = name;
+  DB.set('profile', name);
+  closeSheet();
+  toast('Listening as ' + name);
+}
+
+function addProfile() {
+  const el = document.getElementById('pname');
+  const name = (el.value || '').trim();
+  if (!name) return;
+  if (!state.profiles.includes(name)) state.profiles.push(name);
+  state.profile = name;
+  save();
+  el.value = '';
+  openProfiles();
+}
+
+function deleteProfile(name) {
+  if (state.profiles.length < 2) return;
+  const doomed = state.bookmarks.filter(b => (b.profile || 'Me') === name);
+  const go = () => {
+    doomed.forEach(b => tombstone(b.id));
+    state.bookmarks = state.bookmarks.filter(b => (b.profile || 'Me') !== name);
+    state.profiles = state.profiles.filter(x => x !== name);
+    if (state.profile === name) state.profile = state.profiles[0];
+    save();
+    openProfiles();
+  };
+  if (doomed.length) {
+    toast(`Delete ${name} and ${doomed.length} bookmark(s)?`, true, { label: 'Delete', run: go });
+  } else go();
 }
 
 /* ── Sheets ───────────────────────────────────────────────── */
@@ -693,6 +1079,30 @@ function openSheet(title) {
   if (!sheet().open) sheet().showModal();
 }
 function closeSheet() { sheet().close(); render(); }
+
+// Tapping the dimmed area outside the sheet closes it.
+document.getElementById('sheet').addEventListener('click', e => {
+  if (e.target.id === 'sheet') closeSheet();
+});
+
+// Drag the grabber down to dismiss, the way iOS sheets behave.
+(function () {
+  const grab = document.getElementById('grabber');
+  const panel = grab.parentElement;
+  let y0 = null;
+  const move = dy => panel.style.transform = dy > 0 ? `translateY(${dy}px)` : '';
+  grab.addEventListener('touchstart', e => { y0 = e.touches[0].clientY; }, { passive: true });
+  grab.addEventListener('touchmove', e => {
+    if (y0 === null) return;
+    move(e.touches[0].clientY - y0);
+  }, { passive: true });
+  grab.addEventListener('touchend', e => {
+    const dy = (e.changedTouches[0].clientY - (y0 ?? 0));
+    y0 = null;
+    panel.style.transform = '';
+    if (dy > 90) closeSheet();
+  });
+})();
 
 function openSettings() {
   const last = DB.get('lastSync');
@@ -727,6 +1137,14 @@ function openSettings() {
          Personal access tokens → Tokens (classic)</b>, ticking <b>only</b> the
          <b>gist</b> scope. Fine-grained tokens can't reach the Gists API.</p>
     `}
+
+    <h2>Rewind on resume</h2>
+    <div class="seg">
+      ${[0, 5, 15, 30].map(n => `<button class="${DB.get('rewindSec', 15) === n ? 'on' : ''}"
+         onclick="DB.set('rewindSec',${n});openSettings()">${n ? n + 's' : 'Off'}</button>`).join('')}
+    </div>
+    <p class="hint">Starts playback slightly before where you stopped, so you don't
+       come back mid-sentence.</p>
 
     <h2>Remember</h2>
     <div class="seg">
@@ -810,8 +1228,8 @@ async function reconcile() {
     if (!items.length) return;
     let changed = false;
 
-    for (const b of state.bookmarks) {
-      const key = b.contextURI || b.id;
+    for (const b of mine()) {
+      const key = b.contextURI || b.key || b.id;
       const plays = items.filter(it =>
         (it.context?.uri === key || it.track?.album?.uri === key) &&
         new Date(it.played_at) > new Date(b.updatedAt));
@@ -825,11 +1243,12 @@ async function reconcile() {
       b.durationMs  = newest.track.duration_ms;
       b.positionMs  = 0;
       b.updatedAt   = newest.played_at;
+      b.history     = pushHistory(b.history, b);
       changed = true;
     }
     if (changed) {
-      state.bookmarks.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-      save(); render();
+      state.bookmarks.sort((a, b) => t2n(b.updatedAt) - t2n(a.updatedAt));
+      save(); autoArchive(); render();
       toast('Caught up from Spotify history');
     }
   } catch (e) { /* scope may be missing until you sign in again */ }
@@ -859,7 +1278,7 @@ function drawWatchlist(results) {
                        w.kind === 'album' ? `onclick="openWatched(${i})"` : 'style="cursor:default"'}>
       ${w.kind === 'keyword' ? '<div class="art">🔍</div>' : artHTML(w.art)}
       <div class="meta"><div class="t1">${esc(w.name)}</div><div class="t2">${w.kind}</div></div>
-      <div class="chev" onclick="event.stopPropagation();removeWatch(${i})" style="color:var(--dim)">✕</div>
+      <button class="more" onclick="event.stopPropagation();removeWatch(${i})" aria-label="Remove">✕</button>
     </div>`).join('')
     : '<div class="empty">Add “Die drei ???”, “Sherlock Holmes”, or any artist you want tracked.</div>';
 
@@ -913,9 +1332,16 @@ function addWatch(r) {
   runSearch();
 }
 function removeWatch(i) {
-  tombstone(state.watchlist[i].id);
+  const gone = state.watchlist[i];
+  tombstone(gone.id);
   state.watchlist.splice(i, 1);
   save(); drawWatchlist();
+  toast('Removed ' + gone.name, false, { label: 'Undo', run() {
+    untombstone(gone.id);
+    gone.addedAt = new Date().toISOString();
+    state.watchlist.unshift(gone);
+    save(); drawWatchlist();
+  }});
 }
 function addKeyword() {
   const el = document.getElementById('kw');
@@ -928,9 +1354,9 @@ function addKeyword() {
 
 function openWatched(i) {
   const w = state.watchlist[i];
-  const b = state.bookmarks.find(x => x.id === w.uri || x.contextURI === w.uri);
-  b ? resume(b) : playAlbum(w.uri, w.name);
+  const b = mine().find(x => x.key === w.uri || x.contextURI === w.uri);
   closeSheet();
+  b ? resume(b) : playAlbum(w.uri, w.name);
 }
 
 /* ── Artist episode browser ───────────────────────────────── */
@@ -964,13 +1390,16 @@ async function loadEpisodes() {
 
 function drawEpisodes() {
   const rows = browse.items.map((e, i) => {
-    const b = state.bookmarks.find(x => x.id === e.uri || x.contextURI === e.uri);
+    const b = mine().find(x => x.key === e.uri || x.contextURI === e.uri);
+    const p = b ? progressOf(b) : null;
     return `<div class="row" onclick="openEpisode(${i})">
       ${artHTML(e.art)}
       <div class="meta">
         <div class="t1">${esc(e.name)}</div>
         <div class="t2" style="${b ? 'color:var(--accent)' : ''}">
-          ${b ? 'Continue at ' + clock(b.positionMs) : esc(e.year)}
+          ${b ? (p ? `Continue · chapter ${p.chapter} of ${p.chapters}`
+                    : 'Continue at ' + clock(b.positionMs))
+              : esc(e.year)}
         </div>
       </div>
       <div class="chev">▶</div>
@@ -984,18 +1413,23 @@ function drawEpisodes() {
 
 function openEpisode(i) {
   const e = browse.items[i];
-  const b = state.bookmarks.find(x => x.id === e.uri || x.contextURI === e.uri);
-  b ? resume(b) : playAlbum(e.uri, e.name);
+  const b = mine().find(x => x.key === e.uri || x.contextURI === e.uri);
   closeSheet();
+  b ? resume(b) : playAlbum(e.uri, e.name);
 }
 
 /* ── Boot ─────────────────────────────────────────────────── */
 (async function init() {
   await handleRedirect();
   state.signedIn = !!DB.get('refresh');
+  autoArchive();
   render();
   if (state.signedIn) { startPolling(); reconcile(); }
   if (GH.token) sync();
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
 })();
 </script>
 </body>
