@@ -93,7 +93,7 @@ def access_token():
 
 def now_playing(token):
     status, data = request(
-        "https://api.spotify.com/v1/me/player",
+        "https://api.spotify.com/v1/me/player?additional_types=episode",
         headers={"Authorization": "Bearer " + token},
     )
     if status == 204 or not data or not data.get("item"):
@@ -103,23 +103,32 @@ def now_playing(token):
         return None
 
     item = data["item"]
-    album = item.get("album") or {}
-    images = album.get("images") or []
-    artists = item.get("artists") or []
+    # A track has an album, a podcast episode a show, a chapter an audiobook.
+    parent = item.get("album") or item.get("show") or item.get("audiobook") or {}
+    images = item.get("images") or parent.get("images") or []
+    people = item.get("artists") or item.get("authors") or []
+
+    if item.get("type") == "chapter" or item.get("audiobook"):
+        kind = "chapter"
+    elif item.get("type") == "episode":
+        kind = "episode"
+    else:
+        kind = "track"
 
     return {
         "trackURI": item["uri"],
         "trackName": item["name"],
-        "trackNumber": item.get("track_number"),
+        "trackNumber": item.get("track_number") or item.get("chapter_number"),
         "durationMs": item.get("duration_ms", 0),
         "positionMs": data.get("progress_ms") or 0,
         "isPlaying": bool(data.get("is_playing")),
         "contextURI": (data.get("context") or {}).get("uri"),
-        "albumURI": album.get("uri"),
-        "albumName": album.get("name") or item["name"],
-        "artistName": artists[0]["name"] if artists else "",
-        "artistURI": artists[0].get("uri") if artists else None,
+        "albumURI": parent.get("uri"),
+        "albumName": parent.get("name") or item["name"],
+        "artistName": (people[0].get("name") if people else parent.get("publisher")) or "",
+        "artistURI": people[0].get("uri") if people else None,
         "art": (images[1] if len(images) > 1 else images[0])["url"] if images else None,
+        "kind": kind,
     }
 
 
@@ -216,7 +225,12 @@ def record(payload, playing):
         print("Playing something outside the watchlist; ignoring.")
         return False
 
-    key = playing["contextURI"] or playing["albumURI"] or playing["trackURI"]
+    # A podcast episode stands alone; an audiobook or Hörspiel is one bookmark
+    # for the whole thing so its chapters collapse into a single row.
+    if playing.get("kind") == "episode":
+        key = playing["trackURI"]
+    else:
+        key = playing["contextURI"] or playing["albumURI"] or playing["trackURI"]
     bookmark_id = f"{PROFILE}::{key}"
     tomb = payload.get("tombstones", {})
     entry = {
@@ -226,6 +240,8 @@ def record(payload, playing):
         "albumName": playing["albumName"],
         "artistName": playing["artistName"],
         "art": playing["art"],
+        "albumURI": playing.get("albumURI"),
+        "kind": playing.get("kind", "track"),
         "contextURI": playing["contextURI"],
         "trackURI": playing["trackURI"],
         "trackName": playing["trackName"],
@@ -262,7 +278,12 @@ def record(payload, playing):
 
     bookmarks.sort(key=lambda b: ts(b.get("updatedAt")), reverse=True)
     payload["updatedAt"] = now_iso()
-    payload.setdefault("version", 1)
+    payload.setdefault("version", 2)
+    # Never drop the profile list — the app relies on it to offer names on a
+    # device that has never typed them.
+    profiles = payload.setdefault("profiles", [])
+    if PROFILE not in profiles:
+        profiles.append(PROFILE)
     return True
 
 

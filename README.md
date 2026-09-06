@@ -103,7 +103,11 @@ http://127.0.0.1:8080/callback
 
 ## 2. Run the setup script once, on your computer
 
-Download `scripts/bootstrap_token.py`, then:
+`bootstrap_token.py` ships alongside this README. Save it anywhere — your Downloads
+folder is fine. **It does not go in your repo**; it runs once and you can delete it
+afterwards.
+
+Open Terminal, `cd` to wherever you saved it, then:
 
 ```bash
 export SPOTIFY_CLIENT_ID=your_client_id
@@ -111,7 +115,11 @@ export SPOTIFY_CLIENT_SECRET=your_client_secret
 python3 bootstrap_token.py
 ```
 
-Your browser opens, you approve, and the terminal prints a long token. Copy it.
+Your browser opens, you approve, and the terminal prints a long token between two
+lines of `=`. Copy it.
+
+If Terminal says `command not found: python3`, install Python from
+<https://www.python.org/downloads/> and try again.
 
 ## 3. Upload the job files
 
@@ -153,13 +161,15 @@ From now on it runs by itself every 5 minutes.
 back mid-sentence (change under **⋯ → Rewind on resume**).
 
 **👤 chip** — switch between listeners. Each profile keeps its own bookmarks, so you
-and your partner won't overwrite each other in the same series.
+and your partner won't overwrite each other in the same series. Profiles created on
+one device appear on the others after a sync — no need to retype the name.
 
 **🔈 chip** — choose where playback goes. Pin your phone here if you're tired of
 audio landing on the kitchen speaker. Speakers are never picked automatically.
 
-**★ button** — follow an artist and get their full episode list, so you can start any
-episode straight from the app. Or add an album, or a keyword.
+**★ button** — search and follow an **artist** (get their full release list), a
+**podcast** (get its episode list), an **album**, an **audiobook**, or a plain
+keyword. Tap anything in the list to start or continue it.
 
 **⋯ on a row** — Continue, **Jump back to earlier**, Mark as finished, Forget.
 
@@ -168,6 +178,18 @@ while you listen, so if you doze off in chapter 12 and Spotify runs on to chapte
 you can pick "22:35 · Chapter 12" and carry on from there.
 
 Episodes past 97% move themselves into a collapsed **Finished** list.
+
+**Works with podcasts and audiobooks too**, not just Hörspiele. They're bookmarked
+differently because they mean different things:
+
+| | One bookmark per | Progress shown |
+|---|---|---|
+| Hörspiel / album | the whole album | across all chapters — "Chapter 17 of 42 · 40%" |
+| Audiobook | the whole book | across all chapters |
+| Podcast | each episode | within that episode |
+
+Every row shows a percentage. It appears a moment after a new item is added, once
+the chapter list has been fetched and cached.
 
 ---
 
@@ -182,6 +204,8 @@ Episodes past 97% move themselves into a collapsed **Finished** list.
 | "No Spotify device found" | Spotify isn't open anywhere. Tap **Open Spotify here** in the 🔈 menu, then try again. |
 | Playback goes to the wrong speaker | Pin the right device via the 🔈 chip. |
 | Bookmarks disappeared | Safari clears site data after ~7 days of not visiting. Set up Part 2 and it's recoverable. |
+| No percentage on a row | The chapter list is still loading, or Spotify wouldn't return it. Wait a few seconds; ⋯ → **Clear album cache** forces a retry. |
+| A profile is missing on a new device | Connect sync (Part 2) on that device first, then reopen the 👤 menu. |
 | GitHub token rejected | Must be a classic token with the `gist` scope. Fine-grained tokens don't work. |
 
 **Position is up to 5 minutes behind** if you use Part 3, because that's GitHub's

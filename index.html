@@ -147,7 +147,7 @@
    The redirect URI is this page's own URL; register it verbatim
    in the Spotify dashboard.
    ════════════════════════════════════════════════════════════ */
-const CLIENT_ID = 'fcac2f6154a841bb8ac819f12823e994';
+const CLIENT_ID = 'PASTE_YOUR_SPOTIFY_CLIENT_ID';
 
 const REDIRECT_URI = location.origin + location.pathname;
 const SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing user-read-recently-played';
@@ -384,12 +384,17 @@ function pushHistory(history, entry) {
 
 function record(np) {
   if (state.mode === 'watchlist' && !watchMatches(np)) return;
-  const key = np.contextURI || np.albumURI || np.trackURI;
+  // A podcast episode stands alone. An audiobook or Hörspiel is one bookmark for
+  // the whole thing, so its many chapters collapse into a single row.
+  const key = np.kind === 'episode'
+    ? np.trackURI
+    : (np.contextURI || np.albumURI || np.trackURI);
   const id = state.profile + '::' + key;
   const tomb = DB.get('tombstones', {});
 
   const entry = { id, profile: state.profile, key,
                   albumName: np.albumName, artistName: np.artistName, art: np.art,
+                  albumURI: np.albumURI, kind: np.kind || 'track',
                   contextURI: np.contextURI, trackURI: np.trackURI, trackName: np.trackName,
                   trackNumber: np.trackNumber, positionMs: np.positionMs,
                   durationMs: np.durationMs, updatedAt: new Date().toISOString(),
@@ -416,6 +421,17 @@ function record(np) {
 /** Only the current profile's bookmarks. */
 const mine = () => state.bookmarks.filter(b => (b.profile || 'Me') === state.profile);
 
+/** Every profile we know of: the synced list, plus any owner seen on a bookmark.
+    A device that has only just pulled the gist can pick a profile it never typed. */
+function knownProfiles() {
+  return [...new Set([
+    ...state.profiles,
+    ...state.bookmarks.map(b => b.profile).filter(Boolean),
+    state.profile,
+    'Me'
+  ])].sort((a, b) => a.localeCompare(b));
+}
+
 /* ── Album track maps ─────────────────────────────────────────
    A 40-track Hörspiel needs its full track list before "how far in
    am I" means anything. Albums never change, so this is cached
@@ -424,36 +440,69 @@ const mine = () => state.bookmarks.filter(b => (b.profile || 'Me') === state.pro
 const albumCache = () => DB.get('albums', {});
 let albumFetching = false;
 
-async function fetchAlbum(uri) {
-  if (!uri || !uri.startsWith('spotify:album:')) return null;
+/** Which endpoint lists the parts of this thing. Podcasts are excluded on
+    purpose — "62% through a podcast series" is meaningless; an episode's own
+    progress is what matters. */
+function partsEndpoint(uri) {
+  const [, kind, id] = (uri || '').split(':');
+  if (kind === 'album')     return `/v1/albums/${id}/tracks`;
+  if (kind === 'audiobook') return `/v1/audiobooks/${id}/chapters`;
+  return null;
+}
+
+async function fetchContainer(uri) {
   const cache = albumCache();
-  if (cache[uri]) return cache[uri];
+  if (cache[uri]) return cache[uri].failed ? null : cache[uri];
 
-  const id = uri.split(':').pop();
-  const tracks = {};
+  const endpoint = partsEndpoint(uri);
+  if (!endpoint) return null;
+
+  const parts = {};
   let total = 0, offset = 0, count = 0;
-
-  while (offset < 400) {
-    const page = await api(`/v1/albums/${id}/tracks?limit=50&offset=${offset}`);
-    const items = page?.items || [];
-    for (const t of items) {
-      tracks[t.uri] = { o: total, i: t.track_number ?? (count + 1) };
-      total += t.duration_ms || 0;
-      count++;
+  try {
+    while (offset < 400) {
+      const page = await api(`${endpoint}?limit=50&offset=${offset}`);
+      const items = page?.items || [];
+      for (const t of items) {
+        parts[t.uri] = { o: total, i: t.track_number ?? t.chapter_number ?? (count + 1) };
+        total += t.duration_ms || 0;
+        count++;
+      }
+      if (items.length < 50) break;
+      offset += 50;
     }
-    if (items.length < 50) break;
-    offset += 50;
+  } catch (e) {
+    // Remember the failure, or warmAlbums retries it on every single render.
+    cache[uri] = { failed: true, at: Date.now() };
+    DB.set('albums', cache);
+    return null;
   }
-  if (!count) return null;
+  if (!count) {
+    cache[uri] = { failed: true, at: Date.now() };
+    DB.set('albums', cache);
+    return null;
+  }
 
-  cache[uri] = { totalMs: total, tracks, count, at: Date.now() };
+  cache[uri] = { totalMs: total, tracks: parts, count, at: Date.now() };
   DB.set('albums', cache);
   return cache[uri];
 }
 
+/** The album or audiobook a bookmark belongs to. Falls back to albumURI for
+    anything played straight from search, which has no context. */
+const containerOf = b =>
+  [b.contextURI, b.albumURI].find(u => partsEndpoint(u)) || null;
+
 /** Album-level progress, or null while the track map is still unknown. */
 function progressOf(b) {
-  const meta = albumCache()[b.contextURI || ''];
+  // Podcast episodes stand alone — progress is through the episode itself.
+  if (b.kind === 'episode') {
+    if (!b.durationMs) return null;
+    return { elapsed: b.positionMs, total: b.durationMs,
+             fraction: Math.min(1, b.positionMs / b.durationMs),
+             chapter: null, chapters: null };
+  }
+  const meta = albumCache()[containerOf(b) || ''];
   const hit = meta?.tracks?.[b.trackURI];
   if (!meta?.totalMs || !hit) return null;
   const elapsed = hit.o + b.positionMs;
@@ -466,14 +515,14 @@ function progressOf(b) {
 async function warmAlbums() {
   if (albumFetching) return;
   const cache = albumCache();
-  const missing = state.bookmarks
-    .filter(b => b.contextURI?.startsWith('spotify:album:') && !cache[b.contextURI])
-    .slice(0, 3);
+  const missing = [...new Set(
+    state.bookmarks.map(containerOf).filter(u => u && !cache[u])
+  )].slice(0, 3);
   if (!missing.length) return;
 
   albumFetching = true;
-  for (const b of missing) {
-    try { await fetchAlbum(b.contextURI); } catch (e) { break; }
+  for (const uri of missing) {
+    try { await fetchContainer(uri); } catch (e) { break; }
   }
   albumFetching = false;
   autoArchive();
@@ -632,6 +681,7 @@ async function sync(manual) {
     DB.set('lastSync', new Date().toISOString());
     autoArchive();
     render();
+    if (sheet().open && refreshSheet) refreshSheet();
     if (manual) toast('Synced');
   } catch (e) {
     if (e.status === 401) toast('GitHub token rejected — check it in Settings.', true);
@@ -667,20 +717,40 @@ function disconnectGist() {
 }
 
 /* ── Player ───────────────────────────────────────────────── */
+
+/** Normalises a track, a podcast episode or an audiobook chapter into one shape.
+    Each carries a different parent field: album, show, audiobook. */
+function describeItem(d) {
+  const it = d.item;
+  const parent = it.album || it.show || it.audiobook || null;
+  const imgs = it.images || parent?.images || [];
+  const people = it.artists || it.authors || [];
+  const kind = it.type === 'chapter' ? 'chapter'
+             : it.type === 'episode' ? (it.audiobook ? 'chapter' : 'episode')
+             : 'track';
+
+  return {
+    trackURI: it.uri,
+    trackName: it.name,
+    trackNumber: it.track_number ?? it.chapter_number ?? null,
+    durationMs: it.duration_ms || 0,
+    positionMs: d.progress_ms || 0,
+    isPlaying: !!d.is_playing,
+    contextURI: d.context?.uri || null,
+    albumURI: parent?.uri || null,
+    albumName: parent?.name || it.name,
+    artistName: people[0]?.name || parent?.publisher || '',
+    artistURI: people[0]?.uri || null,
+    art: (imgs.length > 1 ? imgs[1] : imgs[0])?.url || null,
+    kind
+  };
+}
 async function poll() {
   if (!state.signedIn) return;
   try {
-    const d = await api('/v1/me/player');
+    const d = await api('/v1/me/player?additional_types=episode');
     if (!d || !d.item) { state.nowPlaying = null; return render(); }
-    const imgs = d.item.album?.images || [];
-    state.nowPlaying = {
-      trackURI: d.item.uri, trackName: d.item.name, trackNumber: d.item.track_number,
-      durationMs: d.item.duration_ms, positionMs: d.progress_ms || 0, isPlaying: !!d.is_playing,
-      contextURI: d.context?.uri || null, albumURI: d.item.album?.uri || null,
-      albumName: d.item.album?.name || d.item.name,
-      artistName: d.item.artists?.[0]?.name || '', artistURI: d.item.artists?.[0]?.uri || null,
-      art: (imgs.length > 1 ? imgs[1] : imgs[0])?.url || null
-    };
+    state.nowPlaying = describeItem(d);
     record(state.nowPlaying);
     render();
     warmAlbums();
@@ -743,7 +813,15 @@ async function startPlayback(payload, label) {
         await new Promise(res => setTimeout(res, 600));
       } catch (e) {}
     }
-    await api('/v1/me/player/play?device_id=' + r.device.id, 'PUT', payload);
+    try {
+      await api('/v1/me/player/play?device_id=' + r.device.id, 'PUT', payload);
+    } catch (err) {
+      // Shows and audiobooks don't always accept a context. Play the item directly.
+      if ((err.status === 400 || err.status === 404) && payload.context_uri && payload.offset?.uri) {
+        await api('/v1/me/player/play?device_id=' + r.device.id, 'PUT',
+          { uris: [payload.offset.uri], position_ms: payload.position_ms });
+      } else throw err;
+    }
     DB.set('lastDevice', r.device.id);
     toast(`Continuing ${label} on ${r.device.name}`);
     setTimeout(poll, 1200);
@@ -804,12 +882,19 @@ function artHTML(url, cls) {
 
 /** One saved Hörspiel. Album progress when the track map is known, chapter progress
     while it's still loading. */
+const KIND_TAG = { episode: 'Podcast', chapter: 'Audiobook' };
+
 function bookmarkRow(b) {
   const p = progressOf(b);
   const pct = p ? p.fraction : (b.durationMs ? b.positionMs / b.durationMs : 0);
-  const line2 = p
+  const percent = Math.round(pct * 100);
+
+  const line2 = p && p.chapter
     ? `Chapter ${p.chapter} of ${p.chapters} · ${esc(b.trackName)}`
-    : (b.trackNumber ? `Track ${b.trackNumber} · ` : '') + esc(b.trackName);
+    : (KIND_TAG[b.kind] ? KIND_TAG[b.kind] + ' · ' : '')
+      + (b.trackNumber && !KIND_TAG[b.kind] ? `Track ${b.trackNumber} · ` : '')
+      + esc(b.trackName);
+
   const times = p ? `${clock(p.elapsed)} / ${clock(p.total)}`
                   : `${clock(b.positionMs)} / ${clock(b.durationMs)}`;
 
@@ -818,8 +903,11 @@ function bookmarkRow(b) {
     <div class="meta">
       <div class="t1">${esc(b.albumName)}</div>
       <div class="t2">${line2}</div>
-      <div class="bar"><i style="width:${Math.round(pct * 100)}%"></i></div>
-      <div class="t3"><span>${times}</span><span>${ago(b.updatedAt)}</span></div>
+      <div class="bar"><i style="width:${percent}%"></i></div>
+      <div class="t3">
+        <span><b style="color:var(--accent);font-weight:650">${percent}%</b> · ${times}</span>
+        <span>${ago(b.updatedAt)}</span>
+      </div>
     </div>
     <button class="more" onclick="event.stopPropagation();openBookmark('${esc(b.id)}')"
             aria-label="Options">⋯</button>
@@ -1011,8 +1099,8 @@ function jumpBack(id, index) {
 
 /* ── Profiles ─────────────────────────────────────────────── */
 function openProfiles() {
-  openSheet('Who is listening');
-  const rows = state.profiles.map(name => {
+  openSheet('Who is listening', openProfiles);
+  const rows = knownProfiles().map(name => {
     const count = state.bookmarks.filter(b => (b.profile || 'Me') === name).length;
     const safe = esc(name).replace(/'/g, '&#39;');
     return `<div class="row" onclick="pickProfile('${safe}')">
@@ -1020,7 +1108,7 @@ function openProfiles() {
       <div class="meta"><div class="t1">${esc(name)}</div>
         <div class="t2">${count} bookmark${count === 1 ? '' : 's'}</div></div>
       ${name === state.profile ? '<span class="tick">✓</span>'
-        : (state.profiles.length > 1
+        : (knownProfiles().length > 1
           ? `<button class="more" onclick="event.stopPropagation();deleteProfile('${safe}')">✕</button>`
           : '')}
     </div>`;
@@ -1040,6 +1128,7 @@ function openProfiles() {
 
 function pickProfile(name) {
   state.profile = name;
+  if (!state.profiles.includes(name)) { state.profiles.push(name); save(); }
   DB.set('profile', name);
   closeSheet();
   toast('Listening as ' + name);
@@ -1057,13 +1146,13 @@ function addProfile() {
 }
 
 function deleteProfile(name) {
-  if (state.profiles.length < 2) return;
+  if (knownProfiles().length < 2) return;
   const doomed = state.bookmarks.filter(b => (b.profile || 'Me') === name);
   const go = () => {
     doomed.forEach(b => tombstone(b.id));
     state.bookmarks = state.bookmarks.filter(b => (b.profile || 'Me') !== name);
     state.profiles = state.profiles.filter(x => x !== name);
-    if (state.profile === name) state.profile = state.profiles[0];
+    if (state.profile === name) state.profile = knownProfiles()[0] || 'Me';
     save();
     openProfiles();
   };
@@ -1074,11 +1163,13 @@ function deleteProfile(name) {
 
 /* ── Sheets ───────────────────────────────────────────────── */
 const sheet = () => document.getElementById('sheet');
-function openSheet(title) {
+let refreshSheet = null;      // redraw hook for whichever sheet is open
+function openSheet(title, redraw) {
   document.getElementById('sheetTitle').textContent = title;
+  refreshSheet = redraw || null;
   if (!sheet().open) sheet().showModal();
 }
-function closeSheet() { sheet().close(); render(); }
+function closeSheet() { refreshSheet = null; sheet().close(); render(); }
 
 // Tapping the dimmed area outside the sheet closes it.
 document.getElementById('sheet').addEventListener('click', e => {
@@ -1274,8 +1365,9 @@ function drawWatchlist(results) {
   }).join('');
 
   const wl = state.watchlist.length ? state.watchlist.map((w, i) => `
-    <div class="row" ${w.kind === 'artist' ? `onclick="browseArtist(${i})"` :
-                       w.kind === 'album' ? `onclick="openWatched(${i})"` : 'style="cursor:default"'}>
+    <div class="row" ${(w.kind === 'artist' || w.kind === 'show') ? `onclick="browseWatch(${i})"` :
+                       (w.kind === 'album' || w.kind === 'audiobook') ? `onclick="openWatched(${i})"` :
+                       'style="cursor:default"'}>
       ${w.kind === 'keyword' ? '<div class="art">🔍</div>' : artHTML(w.art)}
       <div class="meta"><div class="t1">${esc(w.name)}</div><div class="t2">${w.kind}</div></div>
       <button class="more" onclick="event.stopPropagation();removeWatch(${i})" aria-label="Remove">✕</button>
@@ -1309,12 +1401,21 @@ async function runSearch() {
   const term = currentQuery.trim();
   if (term.length < 2) return drawWatchlist();
   try {
-    const d = await api('/v1/search?type=artist,album&limit=12&q=' + encodeURIComponent(term));
+    const d = await api('/v1/search?type=artist,album,show,audiobook&limit=8&q='
+      + encodeURIComponent(term));
+    const pick = list => list || [];
     const out = [
-      ...(d.artists?.items || []).map(a => ({
+      ...pick(d.artists?.items).map(a => ({
         kind: 'artist', id: a.id, uri: a.uri, name: a.name,
         subtitle: 'Artist', art: a.images?.slice(-1)[0]?.url || null })),
-      ...(d.albums?.items || []).map(a => ({
+      ...pick(d.shows?.items).map(a => ({
+        kind: 'show', id: a.id, uri: a.uri, name: a.name,
+        subtitle: 'Podcast · ' + (a.publisher || ''), art: a.images?.slice(-1)[0]?.url || null })),
+      ...pick(d.audiobooks?.items).map(a => ({
+        kind: 'audiobook', id: a.id, uri: a.uri, name: a.name,
+        subtitle: 'Audiobook · ' + (a.authors?.[0]?.name || ''),
+        art: a.images?.slice(-1)[0]?.url || null })),
+      ...pick(d.albums?.items).map(a => ({
         kind: 'album', id: a.id, uri: a.uri, name: a.name,
         subtitle: a.artists?.[0]?.name || 'Album', art: a.images?.slice(-1)[0]?.url || null }))
     ];
@@ -1357,14 +1458,15 @@ function openWatched(i) {
   const b = mine().find(x => x.key === w.uri || x.contextURI === w.uri);
   closeSheet();
   b ? resume(b) : playAlbum(w.uri, w.name);
+
 }
 
-/* ── Artist episode browser ───────────────────────────────── */
-let browse = { artist: null, items: [], offset: 0, done: false };
+/* ── Episode browser: an artist's releases, or a podcast's episodes ── */
+let browse = { source: null, items: [], offset: 0, done: false };
 
-async function browseArtist(i) {
+async function browseWatch(i) {
   const w = state.watchlist[i];
-  browse = { artist: { ...w, id: w.spotifyId || w.id.split(':').pop() },
+  browse = { source: { ...w, id: w.spotifyId || String(w.id).split(':').pop() },
              items: [], offset: 0, done: false };
   openSheet(w.name);
   document.getElementById('sheetBody').innerHTML = '<div class="center">Loading…</div>';
@@ -1373,9 +1475,14 @@ async function browseArtist(i) {
 
 async function loadEpisodes() {
   if (browse.done) return;
+  const src = browse.source;
   try {
-    const d = await api(`/v1/artists/${browse.artist.id}/albums?include_groups=album,single&limit=50&offset=${browse.offset}`);
-    const items = (d.items || []).map(a => ({
+    const path = src.kind === 'show'
+      ? `/v1/shows/${src.id}/episodes?limit=50&offset=${browse.offset}`
+      : `/v1/artists/${src.id}/albums?include_groups=album,single&limit=50&offset=${browse.offset}`;
+
+    const d = await api(path);
+    const items = (d.items || []).filter(Boolean).map(a => ({
       id: a.id, uri: a.uri, name: a.name,
       year: (a.release_date || '').slice(0, 4),
       art: a.images?.slice(-1)[0]?.url || null
@@ -1383,22 +1490,26 @@ async function loadEpisodes() {
     browse.items = browse.items.concat(items);
     browse.offset += items.length;
     if (items.length < 50) browse.done = true;
-    browse.items.sort((a, b) => (b.year || '').localeCompare(a.year || ''));
+    // Podcast episodes already arrive newest-first; album releases need sorting.
+    if (src.kind !== 'show') {
+      browse.items.sort((a, b) => (b.year || '').localeCompare(a.year || ''));
+    }
     drawEpisodes();
   } catch (e) { toast(e.message, true); }
 }
 
 function drawEpisodes() {
   const rows = browse.items.map((e, i) => {
-    const b = mine().find(x => x.key === e.uri || x.contextURI === e.uri);
+    const b = mine().find(x => x.key === e.uri || x.contextURI === e.uri || x.trackURI === e.uri);
     const p = b ? progressOf(b) : null;
     return `<div class="row" onclick="openEpisode(${i})">
       ${artHTML(e.art)}
       <div class="meta">
         <div class="t1">${esc(e.name)}</div>
         <div class="t2" style="${b ? 'color:var(--accent)' : ''}">
-          ${b ? (p ? `Continue · chapter ${p.chapter} of ${p.chapters}`
-                    : 'Continue at ' + clock(b.positionMs))
+          ${b ? (p && p.chapter ? `Continue · chapter ${p.chapter} of ${p.chapters}`
+                                : `Continue at ${clock(b.positionMs)}`
+                                  + (p ? ` · ${Math.round(p.fraction * 100)}%` : ''))
               : esc(e.year)}
         </div>
       </div>
@@ -1413,9 +1524,13 @@ function drawEpisodes() {
 
 function openEpisode(i) {
   const e = browse.items[i];
-  const b = mine().find(x => x.key === e.uri || x.contextURI === e.uri);
+  const b = mine().find(x => x.key === e.uri || x.contextURI === e.uri || x.trackURI === e.uri);
   closeSheet();
-  b ? resume(b) : playAlbum(e.uri, e.name);
+  if (b) return resume(b);
+  // A podcast episode is played directly; an album plays as a context.
+  return e.uri.includes(':episode:')
+    ? startPlayback({ uris: [e.uri], position_ms: 0 }, e.name)
+    : playAlbum(e.uri, e.name);
 }
 
 /* ── Boot ─────────────────────────────────────────────────── */
