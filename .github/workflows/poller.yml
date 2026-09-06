@@ -20,7 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
-      - uses: actions/checkout@v4
+      # v5+ runs on Node 24. Node 20 leaves the runners in September 2026,
+      # so v4 would start failing rather than just warning.
+      - uses: actions/checkout@v5
 
       - name: Record current playback position
         env:
