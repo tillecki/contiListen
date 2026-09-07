@@ -151,7 +151,51 @@ const CLIENT_ID = 'fcac2f6154a841bb8ac819f12823e994';
 
 const REDIRECT_URI = location.origin + location.pathname;
 const SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing user-read-recently-played';
-const API = 'https://api.spotify.com';a
+const API = 'https://api.spotify.com';
+
+/* ── Crash guard ──────────────────────────────────────────────
+   Anything thrown before render() used to leave a blank black page with no
+   clue what happened. Show it instead, with a way out.
+   ──────────────────────────────────────────────────────────── */
+function showFatal(err) {
+  const app = document.getElementById('app');
+  if (!app) return;
+  const msg = (err && (err.stack || err.message)) || String(err);
+  app.innerHTML =
+    '<div style="padding:34px 18px;text-align:center">' +
+      '<div style="font-size:44px">⚠️</div>' +
+      '<h3 style="margin:14px 0 8px;font-size:19px">ContiListen hit an error</h3>' +
+      '<p style="color:#8b9a92;font-size:13.5px;margin:0 0 18px">' +
+        'Your bookmarks are safe in the gist if sync is on.</p>' +
+      '<pre style="text-align:left;background:#131a17;border:1px solid #243029;' +
+        'border-radius:10px;padding:12px;font-size:11px;overflow-x:auto;' +
+        'white-space:pre-wrap;color:#f2d98d">' +
+        String(msg).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) +
+      '</pre>' +
+      '<button onclick="resetLocalData()" style="margin-top:18px;background:#1db954;' +
+        'color:#04140c;border:none;border-radius:12px;padding:14px 20px;font-size:15px;' +
+        'font-weight:650;width:100%;cursor:pointer">Reset this device and reload</button>' +
+      '<p style="color:#8b9a92;font-size:12px;margin-top:12px">' +
+        'Clears local data and caches. You will sign in to Spotify again.</p>' +
+    '</div>';
+}
+
+window.addEventListener('error', e => showFatal(e.error || e.message));
+window.addEventListener('unhandledrejection', e => showFatal(e.reason));
+
+/** Escape hatch: wipe everything local, drop the service worker, start clean. */
+async function resetLocalData() {
+  try { localStorage.clear(); } catch (e) {}
+  try {
+    if ('caches' in window) {
+      for (const k of await caches.keys()) await caches.delete(k);
+    }
+    if ('serviceWorker' in navigator) {
+      for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+    }
+  } catch (e) {}
+  location.replace(location.origin + location.pathname);
+}
 
 /* ── Storage ──────────────────────────────────────────────── */
 const DB = (() => {
@@ -178,11 +222,15 @@ const ARCHIVE_AT = 0.97;          // album fraction that counts as finished
 const HISTORY_CAP = 24;
 const HISTORY_GAP_MS = 4 * 60 * 1000;
 
+// A stored value of the wrong shape would otherwise throw during migrate().
+const asArray = v => Array.isArray(v) ? v : [];
+
 let state = {
-  bookmarks: DB.get('bookmarks', []),
-  watchlist: DB.get('watchlist', []),
+  bookmarks: asArray(DB.get('bookmarks', [])),
+  watchlist: asArray(DB.get('watchlist', [])),
   mode:      DB.get('mode', 'everything'),
-  profiles:  DB.get('profiles', ['Me']),
+  profiles:  asArray(DB.get('profiles', ['Me'])).length
+               ? asArray(DB.get('profiles', ['Me'])) : ['Me'],
   profile:   DB.get('profile', 'Me'),   // per-device, deliberately not synced
   nowPlaying: null,
   signedIn: false,
@@ -195,6 +243,7 @@ let state = {
 (function migrate() {
   let touched = false;
   for (const b of state.bookmarks) {
+    if (!b || typeof b !== 'object') continue;
     if (!b.profile) {
       b.profile = state.profile;
       b.key = b.id;
@@ -1535,10 +1584,15 @@ function openEpisode(i) {
 
 /* ── Boot ─────────────────────────────────────────────────── */
 (async function init() {
-  await handleRedirect();
-  state.signedIn = !!DB.get('refresh');
-  autoArchive();
-  render();
+  try {
+    await handleRedirect();
+    state.signedIn = !!DB.get('refresh');
+    try { autoArchive(); } catch (e) { console.warn('autoArchive', e); }
+    render();
+  } catch (e) {
+    showFatal(e);
+    return;
+  }
   if (state.signedIn) { startPolling(); reconcile(); }
   if (GH.token) sync();
 
