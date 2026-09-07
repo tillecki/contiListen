@@ -150,7 +150,8 @@
 const CLIENT_ID = 'fcac2f6154a841bb8ac819f12823e994';
 
 const REDIRECT_URI = location.origin + location.pathname;
-const SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing user-read-recently-played';
+const SCOPES = 'user-read-playback-state user-modify-playback-state '
+             + 'user-read-currently-playing user-read-recently-played user-read-private';
 const API = 'https://api.spotify.com';
 
 /* ── Crash guard ──────────────────────────────────────────────
@@ -413,7 +414,10 @@ function watchMatches(np) {
   return state.watchlist.some(w => {
     const hay = (s, n) => (s || '').toLowerCase().includes(n.toLowerCase());
     if (w.kind === 'artist') return w.uri === np.artistURI || hay(np.artistName, w.name);
-    if (w.kind === 'album')  return w.uri === np.albumURI || w.uri === np.contextURI;
+    if (w.kind === 'playlist') return w.uri === np.contextURI;
+    if (w.kind === 'album' || w.kind === 'show' || w.kind === 'audiobook') {
+      return w.uri === np.albumURI || w.uri === np.contextURI;
+    }
     return hay(np.albumName, w.name) || hay(np.artistName, w.name) || hay(np.trackName, w.name);
   });
 }
@@ -481,6 +485,35 @@ function knownProfiles() {
   ])].sort((a, b) => a.localeCompare(b));
 }
 
+/* ── Market ───────────────────────────────────────────────────
+   Spotify hides shows and audiobooks entirely unless you tell it which country
+   to look in. Without this, podcast search returns nothing and audiobook
+   chapter lists 404 — which is why neither worked.
+   ──────────────────────────────────────────────────────────── */
+let marketCache = DB.get('market', null);
+
+async function market() {
+  if (marketCache) return marketCache;
+  try {
+    const me = await api('/v1/me');           // needs user-read-private
+    if (me?.country) {
+      marketCache = me.country;
+      DB.set('market', marketCache);
+      return marketCache;
+    }
+  } catch (e) { /* older token without the scope — fall back to the locale */ }
+
+  const guess = (navigator.language || '').split('-')[1];
+  marketCache = guess && guess.length === 2 ? guess.toUpperCase() : null;
+  if (marketCache) DB.set('market', marketCache);
+  return marketCache;
+}
+
+const marketQuery = async () => {
+  const m = await market();
+  return m ? '&market=' + m : '';
+};
+
 /* ── Album track maps ─────────────────────────────────────────
    A 40-track Hörspiel needs its full track list before "how far in
    am I" means anything. Albums never change, so this is cached
@@ -492,25 +525,34 @@ let albumFetching = false;
 /** Which endpoint lists the parts of this thing. Podcasts are excluded on
     purpose — "62% through a podcast series" is meaningless; an episode's own
     progress is what matters. */
-function partsEndpoint(uri) {
+function partsEndpoint(uri, allowShow) {
   const [, kind, id] = (uri || '').split(':');
   if (kind === 'album')     return `/v1/albums/${id}/tracks`;
   if (kind === 'audiobook') return `/v1/audiobooks/${id}/chapters`;
+  // Spotify serves some audiobooks as shows, so this is opt-in per bookmark
+  // rather than automatic — "62% through a podcast" would be nonsense.
+  if (kind === 'show' && allowShow) return `/v1/shows/${id}/episodes`;
   return null;
 }
+
+/** Measure across the whole book, or just the part you're on? Defaults by kind;
+    the ⋯ menu overrides it for anything Spotify labels ambiguously. */
+const wantsSeries = b =>
+  b.wholeSeries !== undefined ? !!b.wholeSeries : b.kind !== 'episode';
 
 async function fetchContainer(uri) {
   const cache = albumCache();
   if (cache[uri]) return cache[uri].failed ? null : cache[uri];
 
-  const endpoint = partsEndpoint(uri);
+  const endpoint = partsEndpoint(uri, true);
   if (!endpoint) return null;
 
+  const mk = await marketQuery();
   const parts = {};
   let total = 0, offset = 0, count = 0;
   try {
     while (offset < 400) {
-      const page = await api(`${endpoint}?limit=50&offset=${offset}`);
+      const page = await api(`${endpoint}?limit=50&offset=${offset}${mk}`);
       const items = page?.items || [];
       for (const t of items) {
         parts[t.uri] = { o: total, i: t.track_number ?? t.chapter_number ?? (count + 1) };
@@ -539,13 +581,14 @@ async function fetchContainer(uri) {
 
 /** The album or audiobook a bookmark belongs to. Falls back to albumURI for
     anything played straight from search, which has no context. */
-const containerOf = b =>
-  [b.contextURI, b.albumURI].find(u => partsEndpoint(u)) || null;
+const containerOf = b => wantsSeries(b)
+  ? ([b.contextURI, b.albumURI].find(u => partsEndpoint(u, true)) || null)
+  : null;
 
 /** Album-level progress, or null while the track map is still unknown. */
 function progressOf(b) {
-  // Podcast episodes stand alone — progress is through the episode itself.
-  if (b.kind === 'episode') {
+  // A single episode stands alone — progress is through that episode.
+  if (!wantsSeries(b)) {
     if (!b.durationMs) return null;
     return { elapsed: b.positionMs, total: b.durationMs,
              fraction: Math.min(1, b.positionMs / b.durationMs),
@@ -985,9 +1028,10 @@ function render() {
       ${artHTML(np.art)}
       <div class="meta">
         <div class="t1">${esc(np.albumName)}</div>
-        <div class="t2">${esc(np.trackName)} · ${clock(np.positionMs)}</div>
+        <div class="t2">${np.isPlaying ? '▶' : '⏸'} ${esc(np.trackName)} · ${clock(np.positionMs)}</div>
       </div>
-      <div class="chev">${np.isPlaying ? '▶' : '⏸'}</div>
+      <button class="more" onclick="openAddCurrent()" aria-label="Add to watchlist"
+              style="color:var(--accent);font-size:21px">★</button>
     </div></div>` : '';
 
   const all = mine();
@@ -1059,6 +1103,13 @@ function openBookmark(id) {
         <div class="meta"><div class="t1">Jump back to earlier</div>
           <div class="t2">${n} saved position${n === 1 ? '' : 's'}</div></div>
       </div>
+      <div class="row" onclick="toggleSeries('${esc(b.id)}')">
+        <div class="art">${wantsSeries(b) ? '📚' : '🎧'}</div>
+        <div class="meta"><div class="t1">Measure progress ${wantsSeries(b) ? 'across the whole book' : 'in this part only'}</div>
+          <div class="t2">${wantsSeries(b)
+            ? (progressOf(b) ? 'Chapter list loaded' : 'Chapter list unavailable — tap to measure this part instead')
+            : 'Tap to measure across every chapter instead'}</div></div>
+      </div>
       <div class="row" onclick="toggleArchive('${esc(b.id)}')">
         <div class="art">${b.archived ? '↩' : '✓'}</div>
         <div class="meta"><div class="t1">${b.archived ? 'Move back to Continue' : 'Mark as finished'}</div>
@@ -1070,6 +1121,18 @@ function openBookmark(id) {
           <div class="t2">Removes the bookmark on every device</div></div>
       </div>
     </div>`;
+}
+
+/** Spotify labels some audiobooks as podcasts and vice versa, so this is a
+    manual override rather than something we can always infer. */
+function toggleSeries(id) {
+  const b = byId(id);
+  if (!b) return;
+  b.wholeSeries = !wantsSeries(b);
+  b.updatedAt = new Date().toISOString();
+  save();
+  if (b.wholeSeries) warmAlbums();
+  openBookmark(id);
 }
 
 function toggleArchive(id) {
@@ -1415,8 +1478,8 @@ function drawWatchlist(results) {
 
   const wl = state.watchlist.length ? state.watchlist.map((w, i) => `
     <div class="row" ${(w.kind === 'artist' || w.kind === 'show') ? `onclick="browseWatch(${i})"` :
-                       (w.kind === 'album' || w.kind === 'audiobook') ? `onclick="openWatched(${i})"` :
-                       'style="cursor:default"'}>
+                       (w.kind === 'album' || w.kind === 'audiobook' || w.kind === 'playlist')
+                         ? `onclick="openWatched(${i})"` : 'style="cursor:default"'}>
       ${w.kind === 'keyword' ? '<div class="art">🔍</div>' : artHTML(w.art)}
       <div class="meta"><div class="t1">${esc(w.name)}</div><div class="t2">${w.kind}</div></div>
       <button class="more" onclick="event.stopPropagation();removeWatch(${i})" aria-label="Remove">✕</button>
@@ -1450,8 +1513,8 @@ async function runSearch() {
   const term = currentQuery.trim();
   if (term.length < 2) return drawWatchlist();
   try {
-    const d = await api('/v1/search?type=artist,album,show,audiobook&limit=8&q='
-      + encodeURIComponent(term));
+    const d = await api('/v1/search?type=artist,album,show,audiobook&limit=8'
+      + (await marketQuery()) + '&q=' + encodeURIComponent(term));
     const pick = list => list || [];
     const out = [
       ...pick(d.artists?.items).map(a => ({
@@ -1473,13 +1536,86 @@ async function runSearch() {
   } catch (e) { toast(e.message, true); }
 }
 
-function addWatch(r) {
-  if (!state.watchlist.some(w => w.uri === r.uri)) {
-    state.watchlist.unshift({ kind: r.kind, id: r.uri, uri: r.uri, name: r.name,
-                              art: r.art, spotifyId: r.id, addedAt: new Date().toISOString() });
-    save();
+function addWatchItem(r) {
+  if (state.watchlist.some(w => w.uri === r.uri)) return false;
+  state.watchlist.unshift({ kind: r.kind, id: r.uri, uri: r.uri, name: r.name,
+                            art: r.art, spotifyId: r.id, addedAt: new Date().toISOString() });
+  save();
+  return true;
+}
+
+function addWatch(r) { addWatchItem(r); runSearch(); }
+
+/* ── Add whatever is playing ──────────────────────────────────
+   Offers each layer Spotify reports: the artist, the album (or podcast or
+   audiobook), and the playlist it is playing from.
+   ──────────────────────────────────────────────────────────── */
+const CONTAINER_LABEL = {
+  album: 'Album — one bookmark for the whole thing',
+  show: 'Podcast — browse and continue any episode',
+  audiobook: 'Audiobook',
+  playlist: 'Playlist'
+};
+
+let addOptions = [];
+
+async function openAddCurrent() {
+  const np = state.nowPlaying;
+  if (!np) return toast('Nothing is playing right now.', true);
+
+  openSheet('Add to watchlist', openAddCurrent);
+  const body = document.getElementById('sheetBody');
+  body.innerHTML = '<div class="center">Loading…</div>';
+
+  const opts = [];
+  if (np.artistURI) {
+    opts.push({ kind: 'artist', uri: np.artistURI, name: np.artistName, art: np.art,
+                sub: 'Artist — follow everything they release' });
   }
-  runSearch();
+  if (np.albumURI) {
+    const kind = np.albumURI.split(':')[1];
+    opts.push({ kind, uri: np.albumURI, name: np.albumName, art: np.art,
+                sub: CONTAINER_LABEL[kind] || kind });
+  }
+  if (np.contextURI && np.contextURI.startsWith('spotify:playlist:')
+      && np.contextURI !== np.albumURI) {
+    // The player reports only a playlist's URI, so fetch its name.
+    let name = 'This playlist', art = null;
+    try {
+      const pl = await api('/v1/playlists/' + np.contextURI.split(':').pop()
+                           + '?fields=name,images');
+      name = pl?.name || name;
+      art = pl?.images?.slice(-1)[0]?.url || null;
+    } catch (e) {}
+    opts.push({ kind: 'playlist', uri: np.contextURI, name, art, sub: 'Playlist' });
+  }
+
+  addOptions = opts;
+
+  const rows = opts.map((o, i) => {
+    const already = state.watchlist.some(w => w.uri === o.uri);
+    return `<div class="row" ${already ? 'style="cursor:default"' : `onclick="addCurrent(${i})"`}>
+      ${o.art ? artHTML(o.art) : '<div class="art">♪</div>'}
+      <div class="meta">
+        <div class="t1">${esc(o.name)}</div>
+        <div class="t2">${esc(o.sub)}</div>
+      </div>
+      ${already ? '<span class="tick">✓</span>'
+                : '<span class="addbtn" style="line-height:44px">＋</span>'}
+    </div>`;
+  }).join('');
+
+  body.innerHTML = `
+    <p class="hint" style="margin-top:0">Add what's playing, so it's one tap away next time.</p>
+    <div class="card">${rows || '<div class="empty">Nothing here to follow.</div>'}</div>`;
+}
+
+function addCurrent(i) {
+  const o = addOptions[i];
+  if (!o) return;
+  addWatchItem({ kind: o.kind, id: o.uri.split(':').pop(), uri: o.uri, name: o.name, art: o.art });
+  toast('Added ' + o.name);
+  openAddCurrent();
 }
 function removeWatch(i) {
   const gone = state.watchlist[i];
@@ -1526,8 +1662,9 @@ async function loadEpisodes() {
   if (browse.done) return;
   const src = browse.source;
   try {
+    const mk = await marketQuery();
     const path = src.kind === 'show'
-      ? `/v1/shows/${src.id}/episodes?limit=50&offset=${browse.offset}`
+      ? `/v1/shows/${src.id}/episodes?limit=50&offset=${browse.offset}${mk}`
       : `/v1/artists/${src.id}/albums?include_groups=album,single&limit=50&offset=${browse.offset}`;
 
     const d = await api(path);
