@@ -6,8 +6,13 @@ const CACHE = 'contilisten-v1';
 const SHELL = ['./', './index.html'];
 
 self.addEventListener('install', event => {
+  // addAll rejects the whole install if any URL 404s, which would leave the
+  // worker stuck. Cache what we can and move on.
   event.waitUntil(
-    caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())
+    caches.open(CACHE)
+      .then(c => Promise.allSettled(SHELL.map(u => c.add(u))))
+      .then(() => self.skipWaiting())
+      .catch(() => self.skipWaiting())
   );
 });
 
@@ -25,7 +30,7 @@ self.addEventListener('fetch', event => {
 
   const url = new URL(request.url);
 
-  // Never cache API traffic — a stale playback position is worse than none.
+  // Never cache API traffic â€” a stale playback position is worse than none.
   if (url.hostname.endsWith('spotify.com') || url.hostname.endsWith('github.com')) return;
 
   // Album art: cache-first, it never changes.
@@ -45,8 +50,11 @@ self.addEventListener('fetch', event => {
   event.respondWith(
     fetch(request)
       .then(res => {
-        const copy = res.clone();
-        caches.open(CACHE).then(c => c.put(request, copy));
+        // Never cache an error page â€” that is how a blank screen becomes permanent.
+        if (res && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE).then(c => c.put(request, copy));
+        }
         return res;
       })
       .catch(() => caches.match(request).then(hit => hit || caches.match('./index.html')))
