@@ -164,7 +164,16 @@ async function handleCallback(env, url) {
   const state = url.searchParams.get('state');
   const appOrigin = env.APP_ORIGIN || url.origin;
 
-  if (!code || !state) return Response.redirect(appOrigin + '#error=missing_code', 302);
+  // Spotify explains itself in ?error — pass it through instead of swallowing it.
+  const denied = url.searchParams.get('error');
+  if (denied) {
+    console.log('spotify denied authorisation:', denied);
+    return Response.redirect(appOrigin + '#error=' + encodeURIComponent(denied), 302);
+  }
+  if (!code || !state) {
+    console.log('callback without code. query:', url.search);
+    return Response.redirect(appOrigin + '#error=missing_code', 302);
+  }
 
   const known = await env.DB.prepare('SELECT state FROM oauth_states WHERE state = ?')
     .bind(state).first();
