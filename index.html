@@ -147,11 +147,51 @@
    The redirect URI is this page's own URL; register it verbatim
    in the Spotify dashboard.
    ════════════════════════════════════════════════════════════ */
-const CLIENT_ID = 'PASTE_YOUR_SPOTIFY_CLIENT_ID';
+const WORKER = 'https://contilisten.YOURNAME.workers.dev';   // no trailing slash
 
-const REDIRECT_URI = location.origin + location.pathname;
-const SCOPES = 'user-read-playback-state user-modify-playback-state user-read-currently-playing user-read-recently-played';
-const API = 'https://api.spotify.com';
+/* ── Crash guard ──────────────────────────────────────────────
+   Anything thrown before render() used to leave a blank black page with no
+   clue what happened. Show it instead, with a way out.
+   ──────────────────────────────────────────────────────────── */
+function showFatal(err) {
+  const app = document.getElementById('app');
+  if (!app) return;
+  const msg = (err && (err.stack || err.message)) || String(err);
+  app.innerHTML =
+    '<div style="padding:34px 18px;text-align:center">' +
+      '<div style="font-size:44px">⚠️</div>' +
+      '<h3 style="margin:14px 0 8px;font-size:19px">ContiListen hit an error</h3>' +
+      '<p style="color:#8b9a92;font-size:13.5px;margin:0 0 18px">' +
+        'Your bookmarks are safe in the gist if sync is on.</p>' +
+      '<pre style="text-align:left;background:#131a17;border:1px solid #243029;' +
+        'border-radius:10px;padding:12px;font-size:11px;overflow-x:auto;' +
+        'white-space:pre-wrap;color:#f2d98d">' +
+        String(msg).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) +
+      '</pre>' +
+      '<button onclick="resetLocalData()" style="margin-top:18px;background:#1db954;' +
+        'color:#04140c;border:none;border-radius:12px;padding:14px 20px;font-size:15px;' +
+        'font-weight:650;width:100%;cursor:pointer">Reset this device and reload</button>' +
+      '<p style="color:#8b9a92;font-size:12px;margin-top:12px">' +
+        'Clears local data and caches. You will sign in to Spotify again.</p>' +
+    '</div>';
+}
+
+window.addEventListener('error', e => showFatal(e.error || e.message));
+window.addEventListener('unhandledrejection', e => showFatal(e.reason));
+
+/** Escape hatch: wipe everything local, drop the service worker, start clean. */
+async function resetLocalData() {
+  try { localStorage.clear(); } catch (e) {}
+  try {
+    if ('caches' in window) {
+      for (const k of await caches.keys()) await caches.delete(k);
+    }
+    if ('serviceWorker' in navigator) {
+      for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+    }
+  } catch (e) {}
+  location.replace(location.origin + location.pathname);
+}
 
 /* ── Storage ──────────────────────────────────────────────── */
 const DB = (() => {
@@ -178,11 +218,15 @@ const ARCHIVE_AT = 0.97;          // album fraction that counts as finished
 const HISTORY_CAP = 24;
 const HISTORY_GAP_MS = 4 * 60 * 1000;
 
+// A stored value of the wrong shape would otherwise throw during migrate().
+const asArray = v => Array.isArray(v) ? v : [];
+
 let state = {
-  bookmarks: DB.get('bookmarks', []),
-  watchlist: DB.get('watchlist', []),
+  bookmarks: asArray(DB.get('bookmarks', [])),
+  watchlist: asArray(DB.get('watchlist', [])),
   mode:      DB.get('mode', 'everything'),
-  profiles:  DB.get('profiles', ['Me']),
+  profiles:  asArray(DB.get('profiles', ['Me'])).length
+               ? asArray(DB.get('profiles', ['Me'])) : ['Me'],
   profile:   DB.get('profile', 'Me'),   // per-device, deliberately not synced
   nowPlaying: null,
   signedIn: false,
@@ -195,6 +239,7 @@ let state = {
 (function migrate() {
   let touched = false;
   for (const b of state.bookmarks) {
+    if (!b || typeof b !== 'object') continue;
     if (!b.profile) {
       b.profile = state.profile;
       b.key = b.id;
@@ -261,78 +306,33 @@ function toast(msg, warn, action) {
   toastTimer = setTimeout(() => el.className = 'toast', action ? 7000 : 3600);
 }
 
-/* ── PKCE auth ────────────────────────────────────────────── */
-const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf)))
-  .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+/* ── Session auth ─────────────────────────────────────────────
+   Spotify credentials live in the Worker now. This device only ever holds an
+   opaque session token, which matters on a phone you don't control.
+   ──────────────────────────────────────────────────────────── */
+const session = () => DB.get('session');
 
-async function signIn() {
-  if (CLIENT_ID.startsWith('PASTE')) {
-    return toast('Set CLIENT_ID at the top of index.html first.', true);
+function signIn() {
+  if (WORKER.includes('YOURNAME')) {
+    return toast('Set WORKER at the top of index.html first.', true);
   }
-  const bytes = new Uint8Array(64);
-  crypto.getRandomValues(bytes);
-  const verifier = b64url(bytes);
-  DB.set('verifier', verifier);
-
-  const challenge = b64url(
-    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))
-  );
-  const q = new URLSearchParams({
-    client_id: CLIENT_ID, response_type: 'code', redirect_uri: REDIRECT_URI,
-    code_challenge_method: 'S256', code_challenge: challenge, scope: SCOPES
-  });
-  location.href = 'https://accounts.spotify.com/authorize?' + q;
+  location.href = WORKER + '/auth/login';
 }
 
-async function tokenRequest(body) {
-  const r = await fetch('https://accounts.spotify.com/api/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams(body)
-  });
-  const j = await r.json();
-  if (!r.ok) {
-    if (r.status === 400 || r.status === 401) signOut(true);
-    throw new Error(j.error_description || j.error || 'Token request failed');
-  }
-  DB.set('access', j.access_token);
-  DB.set('expires', Date.now() + (j.expires_in - 60) * 1000);
-  if (j.refresh_token) DB.set('refresh', j.refresh_token);
-  state.signedIn = true;
+/** The Worker sends the session back in the URL fragment after login. */
+function captureSession() {
+  const hash = new URLSearchParams((location.hash || '').replace(/^#/, ''));
+  const token = hash.get('session');
+  const err = hash.get('error');
+  history.replaceState({}, '', location.origin + location.pathname);
+  if (err) { toast('Sign-in failed: ' + err, true); return false; }
+  if (token) { DB.set('session', token); return true; }
+  return false;
 }
 
-async function handleRedirect() {
-  const p = new URLSearchParams(location.search);
-  if (p.get('error')) {
-    history.replaceState({}, '', REDIRECT_URI);
-    toast('Spotify sign-in was cancelled.', true);
-    return;
-  }
-  const code = p.get('code');
-  if (!code) return;
-  const verifier = DB.get('verifier');
-  history.replaceState({}, '', REDIRECT_URI);
-  if (!verifier) return;
-  try {
-    await tokenRequest({
-      grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI,
-      client_id: CLIENT_ID, code_verifier: verifier
-    });
-    DB.del('verifier');
-  } catch (e) { toast(e.message, true); }
-}
-
-async function token() {
-  const access = DB.get('access'), expires = DB.get('expires', 0);
-  if (access && Date.now() < expires) return access;
-  const refresh = DB.get('refresh');
-  if (!refresh) throw new Error('NOT_SIGNED_IN');
-  await tokenRequest({ grant_type: 'refresh_token', refresh_token: refresh, client_id: CLIENT_ID });
-  return DB.get('access');
-}
-
-function signOut(quiet) {
-  ['access','expires','refresh','verifier'].forEach(DB.del);
+async function signOut(quiet) {
+  try { await worker('/api/logout', 'POST'); } catch (e) {}
+  ['session'].forEach(DB.del);
   state.signedIn = false;
   state.nowPlaying = null;
   stopPolling();
@@ -340,19 +340,54 @@ function signOut(quiet) {
   if (!quiet) toast('Signed out.');
 }
 
-/* ── API ──────────────────────────────────────────────────── */
-async function api(path, method = 'GET', body) {
-  const t = await token();
-  const r = await fetch(API + path, {
+/* ── Worker calls ─────────────────────────────────────────── */
+async function worker(path, method = 'GET', body) {
+  const token = session();
+  if (!token) throw new Error('NOT_SIGNED_IN');
+
+  const res = await fetch(WORKER + path, {
     method,
-    headers: { Authorization: 'Bearer ' + t, ...(body ? {'Content-Type':'application/json'} : {}) },
+    headers: {
+      Authorization: 'Bearer ' + token,
+      ...(body ? { 'Content-Type': 'application/json' } : {})
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    keepalive: method === 'POST' && !!body   // survives the page closing
+  });
+
+  if (res.status === 401) { DB.del('session'); throw new Error('NOT_SIGNED_IN'); }
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!res.ok) {
+    const e = new Error(data?.error || res.statusText);
+    e.status = res.status;
+    throw e;
+  }
+  return data;
+}
+
+/* ── API ──────────────────────────────────────────────────── */
+/** Same call signature as before, but routed through the Worker so no Spotify
+    token ever reaches this device. */
+async function api(path, method = 'GET', body) {
+  const token = session();
+  if (!token) throw new Error('NOT_SIGNED_IN');
+
+  const r = await fetch(WORKER + '/api/spotify' + path, {
+    method,
+    headers: {
+      Authorization: 'Bearer ' + token,
+      ...(body ? { 'Content-Type': 'application/json' } : {})
+    },
     body: body ? JSON.stringify(body) : undefined
   });
+
+  if (r.status === 401) { DB.del('session'); state.signedIn = false; throw new Error('NOT_SIGNED_IN'); }
   if (r.status === 204) return null;
   const text = await r.text();
   const data = text ? JSON.parse(text) : null;
   if (!r.ok) {
-    const err = new Error(data?.error?.message || r.statusText);
+    const err = new Error(data?.error?.message || data?.error || r.statusText);
     err.status = r.status;
     throw err;
   }
@@ -364,7 +399,10 @@ function watchMatches(np) {
   return state.watchlist.some(w => {
     const hay = (s, n) => (s || '').toLowerCase().includes(n.toLowerCase());
     if (w.kind === 'artist') return w.uri === np.artistURI || hay(np.artistName, w.name);
-    if (w.kind === 'album')  return w.uri === np.albumURI || w.uri === np.contextURI;
+    if (w.kind === 'playlist') return w.uri === np.contextURI;
+    if (w.kind === 'album' || w.kind === 'show' || w.kind === 'audiobook') {
+      return w.uri === np.albumURI || w.uri === np.contextURI;
+    }
     return hay(np.albumName, w.name) || hay(np.artistName, w.name) || hay(np.trackName, w.name);
   });
 }
@@ -432,6 +470,35 @@ function knownProfiles() {
   ])].sort((a, b) => a.localeCompare(b));
 }
 
+/* ── Market ───────────────────────────────────────────────────
+   Spotify hides shows and audiobooks entirely unless you tell it which country
+   to look in. Without this, podcast search returns nothing and audiobook
+   chapter lists 404 — which is why neither worked.
+   ──────────────────────────────────────────────────────────── */
+let marketCache = DB.get('market', null);
+
+async function market() {
+  if (marketCache) return marketCache;
+  try {
+    const me = await api('/v1/me');           // needs user-read-private
+    if (me?.country) {
+      marketCache = me.country;
+      DB.set('market', marketCache);
+      return marketCache;
+    }
+  } catch (e) { /* older token without the scope — fall back to the locale */ }
+
+  const guess = (navigator.language || '').split('-')[1];
+  marketCache = guess && guess.length === 2 ? guess.toUpperCase() : null;
+  if (marketCache) DB.set('market', marketCache);
+  return marketCache;
+}
+
+const marketQuery = async () => {
+  const m = await market();
+  return m ? '&market=' + m : '';
+};
+
 /* ── Album track maps ─────────────────────────────────────────
    A 40-track Hörspiel needs its full track list before "how far in
    am I" means anything. Albums never change, so this is cached
@@ -443,25 +510,34 @@ let albumFetching = false;
 /** Which endpoint lists the parts of this thing. Podcasts are excluded on
     purpose — "62% through a podcast series" is meaningless; an episode's own
     progress is what matters. */
-function partsEndpoint(uri) {
+function partsEndpoint(uri, allowShow) {
   const [, kind, id] = (uri || '').split(':');
   if (kind === 'album')     return `/v1/albums/${id}/tracks`;
   if (kind === 'audiobook') return `/v1/audiobooks/${id}/chapters`;
+  // Spotify serves some audiobooks as shows, so this is opt-in per bookmark
+  // rather than automatic — "62% through a podcast" would be nonsense.
+  if (kind === 'show' && allowShow) return `/v1/shows/${id}/episodes`;
   return null;
 }
+
+/** Measure across the whole book, or just the part you're on? Defaults by kind;
+    the ⋯ menu overrides it for anything Spotify labels ambiguously. */
+const wantsSeries = b =>
+  b.wholeSeries !== undefined ? !!b.wholeSeries : b.kind !== 'episode';
 
 async function fetchContainer(uri) {
   const cache = albumCache();
   if (cache[uri]) return cache[uri].failed ? null : cache[uri];
 
-  const endpoint = partsEndpoint(uri);
+  const endpoint = partsEndpoint(uri, true);
   if (!endpoint) return null;
 
+  const mk = await marketQuery();
   const parts = {};
   let total = 0, offset = 0, count = 0;
   try {
     while (offset < 400) {
-      const page = await api(`${endpoint}?limit=50&offset=${offset}`);
+      const page = await api(`${endpoint}?limit=50&offset=${offset}${mk}`);
       const items = page?.items || [];
       for (const t of items) {
         parts[t.uri] = { o: total, i: t.track_number ?? t.chapter_number ?? (count + 1) };
@@ -490,13 +566,14 @@ async function fetchContainer(uri) {
 
 /** The album or audiobook a bookmark belongs to. Falls back to albumURI for
     anything played straight from search, which has no context. */
-const containerOf = b =>
-  [b.contextURI, b.albumURI].find(u => partsEndpoint(u)) || null;
+const containerOf = b => wantsSeries(b)
+  ? ([b.contextURI, b.albumURI].find(u => partsEndpoint(u, true)) || null)
+  : null;
 
 /** Album-level progress, or null while the track map is still unknown. */
 function progressOf(b) {
-  // Podcast episodes stand alone — progress is through the episode itself.
-  if (b.kind === 'episode') {
+  // A single episode stands alone — progress is through that episode.
+  if (!wantsSeries(b)) {
     if (!b.durationMs) return null;
     return { elapsed: b.positionMs, total: b.durationMs,
              fraction: Math.min(1, b.positionMs / b.durationMs),
@@ -540,152 +617,63 @@ function autoArchive() {
   if (changed) save();
 }
 
-/* ── Gist sync ────────────────────────────────────────────────
-   Bookmarks live in a secret gist so phone and laptop share one list.
-   Needs a *classic* GitHub token with only the `gist` scope — fine-grained
-   tokens still can't touch the Gists API.
+/* ── Sync ─────────────────────────────────────────────────────
+   The Worker merges row by row and keeps the newest of each, so two devices
+   editing different series can't clobber one another — which the old
+   whole-document gist could never guarantee.
    ──────────────────────────────────────────────────────────── */
-const GIST_FILE = 'contilisten.json';
+let syncTimer = null, syncing = false, lastSync = DB.get('lastSync', null);
 
-const GH = {
-  get token()  { return DB.get('ghToken'); },
-  set token(v) { v ? DB.set('ghToken', v) : DB.del('ghToken'); },
-  get gistId() { return DB.get('ghGist'); },
-  set gistId(v){ v ? DB.set('ghGist', v) : DB.del('ghGist'); },
-
-  async call(path, method = 'GET', body) {
-    const r = await fetch('https://api.github.com' + path, {
-      method,
-      headers: {
-        Authorization: 'Bearer ' + GH.token,
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        ...(body ? { 'Content-Type': 'application/json' } : {})
-      },
-      body: body ? JSON.stringify(body) : undefined
-    });
-    const text = await r.text();
-    const data = text ? JSON.parse(text) : null;
-    if (!r.ok) {
-      const e = new Error(data?.message || r.statusText);
-      e.status = r.status;
-      throw e;
-    }
-    return data;
+function adoptState(remote) {
+  if (!remote) return;
+  state.bookmarks = remote.bookmarks || [];
+  state.watchlist = remote.watchlist || [];
+  state.profiles = (remote.profiles || []).length ? remote.profiles : ['Me'];
+  if (remote.settings) {
+    state.mode = remote.settings.mode || state.mode;
+    if (remote.settings.rewindSec != null) DB.set('rewindSec', remote.settings.rewindSec);
+    DB.set('pinnedDevice', remote.settings.pinnedDevice || null);
   }
-};
-
-const localPayload = () => ({
-  version: 2,
-  updatedAt: new Date().toISOString(),
-  mode: state.mode,
-  profiles: state.profiles,
-  bookmarks: state.bookmarks,
-  watchlist: state.watchlist,
-  tombstones: DB.get('tombstones', {})
-});
-
-function mergePayload(remote, local) {
-  const tomb = {};
-  for (const k of new Set([...Object.keys(remote.tombstones || {}),
-                           ...Object.keys(local.tombstones || {})])) {
-    const a = remote.tombstones?.[k], b = local.tombstones?.[k];
-    tomb[k] = t2n(a) > t2n(b) ? a : b;
+  if (remote.user) {
+    DB.set('account', remote.user);
+    if (remote.user.market) { marketCache = remote.user.market; DB.set('market', marketCache); }
   }
-  // Forget deletions after 90 days so the file doesn't grow forever.
-  const cutoff = Date.now() - 90 * 864e5;
-  for (const k of Object.keys(tomb)) if (t2n(tomb[k]) < cutoff) delete tomb[k];
-
-  const newest = (list, stamp) => {
-    const m = new Map();
-    for (const x of list) {
-      const prev = m.get(x.id);
-      if (!prev || t2n(x[stamp]) > t2n(prev[stamp])) m.set(x.id, x);
-    }
-    return [...m.values()];
-  };
-
-  const everyBookmark = [...(remote.bookmarks || []), ...(local.bookmarks || [])];
-  // Newest wins for position, but keep whichever copy has the longer breadcrumb
-  // trail — two devices sampling independently both hold real history.
-  const bookmarks = newest(everyBookmark, 'updatedAt')
-    .map(b => {
-      const longest = everyBookmark
-        .filter(x => x.id === b.id)
-        .reduce((acc, x) => (x.history?.length || 0) > acc.length ? x.history : acc, b.history || []);
-      return { ...b, history: (longest || []).slice(-HISTORY_CAP) };
-    })
-    .filter(b => !(tomb[b.id] && t2n(tomb[b.id]) >= t2n(b.updatedAt)))
-    .sort((a, b) => t2n(b.updatedAt) - t2n(a.updatedAt));
-
-  const watchlist = newest([...(remote.watchlist || []), ...(local.watchlist || [])], 'addedAt')
-    .filter(w => !(tomb[w.id] && t2n(tomb[w.id]) >= t2n(w.addedAt)));
-
-  const remoteNewer = t2n(remote.updatedAt) > t2n(local.updatedAt);
-  const profiles = [...new Set([...(remote.profiles || []), ...(local.profiles || []), 'Me'])];
-
-  return { version: 2, updatedAt: new Date().toISOString(),
-           mode: remoteNewer ? (remote.mode || local.mode) : local.mode,
-           profiles, bookmarks, watchlist, tombstones: tomb };
+  DB.set('tombstones', remote.tombstones || {});
+  lastSync = new Date().toISOString();
+  DB.set('lastSync', lastSync);
+  save({ noSync: true });
 }
-
-/// Second device only needs the token — this finds the gist the first one made.
-async function findGist() {
-  const gists = await GH.call('/gists?per_page=100');
-  const hit = (gists || []).find(g => g.files && g.files[GIST_FILE]);
-  return hit ? hit.id : null;
-}
-
-let syncTimer = null, syncing = false;
 
 function scheduleSync() {
-  if (!GH.token) return;
+  if (!state.signedIn) return;
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => sync(), 6000);   // debounce; poll writes often
+  syncTimer = setTimeout(() => sync(), 3000);
 }
 
 async function sync(manual) {
-  if (!GH.token || syncing) return;
+  if (!state.signedIn || syncing) return;
   syncing = true;
   if (manual) render();
   try {
-    if (!GH.gistId) GH.gistId = await findGist();
-
-    let remote = {};
-    if (GH.gistId) {
-      const gist = await GH.call('/gists/' + GH.gistId);
-      const file = gist.files?.[GIST_FILE];
-      if (file) {
-        const content = file.truncated ? await (await fetch(file.raw_url)).text() : file.content;
-        remote = JSON.parse(content || '{}');
+    const payload = {
+      bookmarks: state.bookmarks,
+      watchlist: state.watchlist,
+      profiles: state.profiles,
+      tombstones: DB.get('tombstones', {}),
+      settings: {
+        mode: state.mode,
+        rewindSec: DB.get('rewindSec', 15),
+        pinnedDevice: DB.get('pinnedDevice', null),
+        defaultProfile: state.profile
       }
-    }
-
-    const merged = mergePayload(remote, localPayload());
-    state.bookmarks = merged.bookmarks;
-    state.watchlist = merged.watchlist;
-    state.mode = merged.mode || state.mode;
-    state.profiles = merged.profiles;
-    DB.set('tombstones', merged.tombstones);
-    save({ noSync: true });
-
-    const body = { files: { [GIST_FILE]: { content: JSON.stringify(merged, null, 2) } } };
-    if (GH.gistId) {
-      await GH.call('/gists/' + GH.gistId, 'PATCH', body);
-    } else {
-      const created = await GH.call('/gists', 'POST',
-        { description: 'ContiListen bookmarks', public: false, ...body });
-      GH.gistId = created.id;
-    }
-
-    DB.set('lastSync', new Date().toISOString());
+    };
+    adoptState(await worker('/api/sync', 'POST', payload));
     autoArchive();
     render();
     if (sheet().open && refreshSheet) refreshSheet();
     if (manual) toast('Synced');
   } catch (e) {
-    if (e.status === 401) toast('GitHub token rejected — check it in Settings.', true);
-    else if (e.status === 403) toast('Token lacks the gist scope.', true);
+    if (e.message === 'NOT_SIGNED_IN') { state.signedIn = false; render(); }
     else if (manual) toast('Sync failed: ' + e.message, true);
   } finally {
     syncing = false;
@@ -693,71 +681,19 @@ async function sync(manual) {
   }
 }
 
-async function connectGist(token) {
-  GH.token = token.trim();
-  GH.gistId = null;
-  try {
-    const me = await GH.call('/user');
-    toast('Connected as ' + me.login);
-    await sync(true);
-    openSettings();
-  } catch (e) {
-    GH.token = null;
-    toast(e.status === 401 ? 'That token was rejected.' : e.message, true);
-    openSettings();
-  }
+/** Push one bookmark immediately — small enough to survive the page closing. */
+function pushBookmark(b) {
+  if (!state.signedIn || !b) return;
+  worker('/api/bookmark', 'POST', b).catch(() => {});
 }
 
-function disconnectGist() {
-  GH.token = null;
-  GH.gistId = null;
-  DB.del('lastSync');
-  toast('Sync turned off. Bookmarks stay on this device.');
-  openSettings();
-}
-
-/* ── Player ───────────────────────────────────────────────── */
-
-/** Normalises a track, a podcast episode or an audiobook chapter into one shape.
-    Each carries a different parent field: album, show, audiobook. */
-function describeItem(d) {
-  const it = d.item;
-  const parent = it.album || it.show || it.audiobook || null;
-  const imgs = it.images || parent?.images || [];
-  const people = it.artists || it.authors || [];
-  const kind = it.type === 'chapter' ? 'chapter'
-             : it.type === 'episode' ? (it.audiobook ? 'chapter' : 'episode')
-             : 'track';
-
-  return {
-    trackURI: it.uri,
-    trackName: it.name,
-    trackNumber: it.track_number ?? it.chapter_number ?? null,
-    durationMs: it.duration_ms || 0,
-    positionMs: d.progress_ms || 0,
-    isPlaying: !!d.is_playing,
-    contextURI: d.context?.uri || null,
-    albumURI: parent?.uri || null,
-    albumName: parent?.name || it.name,
-    artistName: people[0]?.name || parent?.publisher || '',
-    artistURI: people[0]?.uri || null,
-    art: (imgs.length > 1 ? imgs[1] : imgs[0])?.url || null,
-    kind
-  };
-}
-async function poll() {
+// Losing the last few seconds of listening was a real bug with the old
+// debounce. keepalive lets this land even as the tab goes away.
+addEventListener('pagehide', () => {
   if (!state.signedIn) return;
-  try {
-    const d = await api('/v1/me/player?additional_types=episode');
-    if (!d || !d.item) { state.nowPlaying = null; return render(); }
-    state.nowPlaying = describeItem(d);
-    record(state.nowPlaying);
-    render();
-    warmAlbums();
-  } catch (e) {
-    if (e.message === 'NOT_SIGNED_IN') { state.signedIn = false; render(); }
-  }
-}
+  const b = state.bookmarks.find(x => x.profile === state.profile);
+  if (b) pushBookmark(b);
+});
 
 /* ── Devices ──────────────────────────────────────────────── */
 const DEVICE_ICON = {
@@ -793,6 +729,35 @@ async function resolveDevice() {
   }
   if (!list.length) return { device: null, reason: 'empty' };
   return { device: [...list].sort((a, b) => rank(a) - rank(b))[0] };
+}
+
+/** Resume through the Worker, which keeps polling for your device while Spotify
+    launches — the step a suspended web page could never perform. */
+async function resumeViaWorker(b, label) {
+  if (state.busy) return;
+  state.busy = true; render();
+  try {
+    // Ask the Worker first so it is already waiting, then wake Spotify.
+    const waiting = worker('/api/resume-sync', 'POST',
+      { profile: b.profile || state.profile, key: b.key || b.id });
+    location.href = 'spotify:';
+
+    const r = await waiting;
+    if (r?.ok) {
+      toast(`Continuing ${label} on ${r.device}`);
+      setTimeout(poll, 1500);
+    } else if (r?.reason === 'premium_required') {
+      toast('Spotify Premium is required to control playback.', true);
+    } else if (r?.reason === 'nothing_saved') {
+      toast('Nothing saved for this profile yet.', true);
+    } else {
+      toast('Spotify never came online. Open it once, then try again.', true);
+    }
+  } catch (e) {
+    toast(e.message || 'Resume failed.', true);
+  } finally {
+    state.busy = false; render();
+  }
 }
 
 async function startPlayback(payload, label) {
@@ -841,15 +806,7 @@ async function startPlayback(payload, label) {
 
 // Dropping back a few seconds re-establishes context — you've usually forgotten
 // the last sentence by the time you come back to it.
-const resume = b => {
-  const pos = Math.max(0, b.positionMs - DB.get('rewindSec', 15) * 1000);
-  return startPlayback(
-    b.contextURI
-      ? { context_uri: b.contextURI, offset: { uri: b.trackURI }, position_ms: pos }
-      : { uris: [b.trackURI], position_ms: pos },
-    b.albumName
-  );
-};
+const resume = b => resumeViaWorker(b, b.albumName);
 const byId = id => state.bookmarks.find(b => b.id === id);
 const resumeById = id => { const b = byId(id); if (b) resume(b); };
 
@@ -870,7 +827,7 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   poll();
   // Another device may have moved a bookmark while this tab was hidden.
-  if (GH.token) sync();
+  if (state.signedIn) sync();
 });
 
 /* ── Render ───────────────────────────────────────────────── */
@@ -903,10 +860,10 @@ function bookmarkRow(b) {
     <div class="meta">
       <div class="t1">${esc(b.albumName)}</div>
       <div class="t2">${line2}</div>
-      <div class="bar"><i style="width:${percent}%"></i></div>
+      <div class="bar"><i id="bar-${esc(b.id)}" style="width:${percent}%"></i></div>
       <div class="t3">
-        <span><b style="color:var(--accent);font-weight:650">${percent}%</b> · ${times}</span>
-        <span>${ago(b.updatedAt)}</span>
+        <span id="stat-${esc(b.id)}"><b style="color:var(--accent);font-weight:650">${percent}%</b> · ${times}</span>
+        <span id="when-${esc(b.id)}">${ago(b.updatedAt)}</span>
       </div>
     </div>
     <button class="more" onclick="event.stopPropagation();openBookmark('${esc(b.id)}')"
@@ -914,8 +871,55 @@ function bookmarkRow(b) {
   </div>`;
 }
 
-function render() {
+/* Rebuilding innerHTML every poll destroyed and recreated every <img>, so the
+   browser re-decoded the artwork each time — that was the flicker. Now the
+   structure is rebuilt only when the list actually changes, and the clock and
+   progress bar are patched in place between times. */
+function listSignature() {
+  return [
+    state.signedIn, state.profile, state.showArchived, state.busy,
+    state.nowPlaying?.trackURI || '',
+    JSON.stringify(DB.get('pinnedDevice', null)),
+    mine().map(b => b.id + ':' + b.archived + ':' + b.trackURI + ':' + b.albumName).join('|')
+  ].join('#');
+}
+
+let lastSignature = null;
+
+/** Update only the numbers, leaving every image element untouched. */
+function patchLive() {
+  const np = state.nowPlaying;
+  if (np) {
+    const el = document.getElementById('np-line');
+    if (el) el.textContent = `${np.isPlaying ? '▶' : '⏸'} ${np.trackName} · ${clock(np.positionMs)}`;
+  }
+  for (const b of mine()) {
+    const p = progressOf(b);
+    const pct = p ? p.fraction : (b.durationMs ? b.positionMs / b.durationMs : 0);
+    const percent = Math.round(pct * 100);
+
+    const bar = document.getElementById('bar-' + b.id);
+    if (bar) bar.style.width = percent + '%';
+
+    const stat = document.getElementById('stat-' + b.id);
+    if (stat) {
+      const times = p ? `${clock(p.elapsed)} / ${clock(p.total)}`
+                      : `${clock(b.positionMs)} / ${clock(b.durationMs)}`;
+      stat.innerHTML = `<b style="color:var(--accent);font-weight:650">${percent}%</b> · ${times}`;
+    }
+    const when = document.getElementById('when-' + b.id);
+    if (when) when.textContent = ago(b.updatedAt);
+  }
+}
+
+function render(force) {
   const app = document.getElementById('app');
+  const signature = listSignature();
+  if (!force && signature === lastSignature && app.innerHTML) {
+    patchLive();
+    return;
+  }
+  lastSignature = signature;
 
   if (!state.signedIn) {
     app.innerHTML = `
@@ -923,8 +927,10 @@ function render() {
         <div class="mark">🎧</div>
         <h3>Pick up where you stopped</h3>
         <p>Spotify only remembers your position in podcasts.
-           ContiListen keeps a bookmark for Hörspiele too.</p>
-        <button class="primary" onclick="signIn()">Connect Spotify</button>
+           ContiListen keeps a bookmark for Hörspiele and audiobooks too.</p>
+        <button class="primary" onclick="signIn()">Sign in with Spotify</button>
+        <p style="font-size:12.5px;margin-top:18px">Your Spotify login is held by your
+           own server, never by this device.</p>
       </div>`;
     return;
   }
@@ -936,9 +942,10 @@ function render() {
       ${artHTML(np.art)}
       <div class="meta">
         <div class="t1">${esc(np.albumName)}</div>
-        <div class="t2">${esc(np.trackName)} · ${clock(np.positionMs)}</div>
+        <div class="t2" id="np-line">${np.isPlaying ? '▶' : '⏸'} ${esc(np.trackName)} · ${clock(np.positionMs)}</div>
       </div>
-      <div class="chev">${np.isPlaying ? '▶' : '⏸'}</div>
+      <button class="more" onclick="openAddCurrent()" aria-label="Add to watchlist"
+              style="color:var(--accent);font-size:21px">★</button>
     </div></div>` : '';
 
   const all = mine();
@@ -1010,6 +1017,13 @@ function openBookmark(id) {
         <div class="meta"><div class="t1">Jump back to earlier</div>
           <div class="t2">${n} saved position${n === 1 ? '' : 's'}</div></div>
       </div>
+      <div class="row" onclick="toggleSeries('${esc(b.id)}')">
+        <div class="art">${wantsSeries(b) ? '📚' : '🎧'}</div>
+        <div class="meta"><div class="t1">Measure progress ${wantsSeries(b) ? 'across the whole book' : 'in this part only'}</div>
+          <div class="t2">${wantsSeries(b)
+            ? (progressOf(b) ? 'Chapter list loaded' : 'Chapter list unavailable — tap to measure this part instead')
+            : 'Tap to measure across every chapter instead'}</div></div>
+      </div>
       <div class="row" onclick="toggleArchive('${esc(b.id)}')">
         <div class="art">${b.archived ? '↩' : '✓'}</div>
         <div class="meta"><div class="t1">${b.archived ? 'Move back to Continue' : 'Mark as finished'}</div>
@@ -1021,6 +1035,18 @@ function openBookmark(id) {
           <div class="t2">Removes the bookmark on every device</div></div>
       </div>
     </div>`;
+}
+
+/** Spotify labels some audiobooks as podcasts and vice versa, so this is a
+    manual override rather than something we can always infer. */
+function toggleSeries(id) {
+  const b = byId(id);
+  if (!b) return;
+  b.wholeSeries = !wantsSeries(b);
+  b.updatedAt = new Date().toISOString();
+  save();
+  if (b.wholeSeries) warmAlbums();
+  openBookmark(id);
 }
 
 function toggleArchive(id) {
@@ -1169,7 +1195,7 @@ function openSheet(title, redraw) {
   refreshSheet = redraw || null;
   if (!sheet().open) sheet().showModal();
 }
-function closeSheet() { refreshSheet = null; sheet().close(); render(); }
+function closeSheet() { refreshSheet = null; sheet().close(); render(true); }
 
 // Tapping the dimmed area outside the sheet closes it.
 document.getElementById('sheet').addEventListener('click', e => {
@@ -1196,38 +1222,26 @@ document.getElementById('sheet').addEventListener('click', e => {
 })();
 
 function openSettings() {
-  const last = DB.get('lastSync');
-  const on = !!GH.token;
+  const account = DB.get('account', {});
+  const rewind = DB.get('rewindSec', 15);
   openSheet('Settings');
   document.getElementById('sheetBody').innerHTML = `
-    <h2 style="margin-top:0">Sync across devices</h2>
-    ${on ? `
-      <div class="card"><div class="row" style="cursor:default">
-        <div class="art">☁️</div>
-        <div class="meta">
-          <div class="t1">Gist sync is on</div>
-          <div class="t2">${last ? 'Last synced ' + ago(last) : 'Not synced yet'}</div>
-        </div>
-      </div></div>
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <button class="ghost" style="flex:1" onclick="sync(true)">${syncing ? 'Syncing…' : 'Sync now'}</button>
-        <button class="ghost" style="flex:1" onclick="disconnectGist()">Disconnect</button>
+    <h2 style="margin-top:0">Account</h2>
+    <div class="card"><div class="row" style="cursor:default">
+      <div class="art">👤</div>
+      <div class="meta">
+        <div class="t1">${esc(account.name || 'Signed in')}</div>
+        <div class="t2">${lastSync ? 'Synced ' + ago(lastSync) : 'Not synced yet'}${
+          account.market ? ' · ' + esc(account.market) : ''}</div>
       </div>
-      ${GH.gistId ? `<p class="hint">Stored in secret gist
-        <a href="https://gist.github.com/${esc(GH.gistId)}" target="_blank"
-           style="color:var(--accent)">${esc(GH.gistId.slice(0, 8))}…</a></p>` : ''}
-    ` : `
-      <p class="hint">Bookmarks are stored per browser. Connect a GitHub token and they'll
-         live in a secret gist instead — shared by every device you paste the same token into.</p>
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <input type="text" id="ghtok" placeholder="ghp_… classic token"
-               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
-        <button class="ghost" onclick="connectGist(document.getElementById('ghtok').value)">Connect</button>
-      </div>
-      <p class="hint">Create one at <b>github.com → Settings → Developer settings →
-         Personal access tokens → Tokens (classic)</b>, ticking <b>only</b> the
-         <b>gist</b> scope. Fine-grained tokens can't reach the Gists API.</p>
-    `}
+    </div></div>
+    <div class="center">
+      <button class="ghost" style="flex:1" onclick="sync(true)">${syncing ? 'Syncing…' : 'Sync now'}</button>
+      <button class="ghost" style="flex:1" onclick="openShortcut()">Siri &amp; Shortcuts</button>
+    </div>
+    <p class="hint">Bookmarks live on your server and merge per title, so two devices
+       never overwrite each other. Your Spotify login stays there too — this device
+       only holds a session token.</p>
 
     <h2>Rewind on resume</h2>
     <div class="seg">
@@ -1247,15 +1261,82 @@ function openSettings() {
       : 'Every album you play gets a bookmark. Tap ✕ on a row to forget it.'}</p>
 
     <h2>Storage</h2>
-    <p class="hint">${DB.ok
-      ? (on
-        ? 'Also in your gist, so a Safari data purge is recoverable — reconnect and it pulls everything back.'
-        : 'Bookmarks live in this browser only. iOS clears site data after about 7 days of not visiting.')
-      : 'Private browsing blocks storage, so bookmarks will vanish when you close this tab.'}</p>
+    <p class="hint">Everything lives on your server, so a Safari data purge costs nothing —
+       sign in again and it all comes back. Chapter lists are cached on this device for
+       speed; clearing them only costs a refetch.</p>
+    <div class="center">
+      <button class="ghost" onclick="DB.set('albums',{});toast('Chapter cache cleared');render()">
+        Clear chapter cache</button>
+    </div>
 
     <div style="margin-top:22px"><button class="primary" style="background:#3a1f1f;color:#ffb4b4" onclick="signOut();closeSheet()">Sign out of Spotify</button></div>`;
 }
 function setMode(m) { state.mode = m; save(); openSettings(); }
+
+/* ── Siri and Shortcuts ───────────────────────────────────────
+   A Shortcut can launch Spotify and *keep running*, which a web page cannot.
+   Paired with the Worker waiting for the device to appear, that turns resume
+   into a single tap from the Home Screen, the Action Button or "Hey Siri".
+   ──────────────────────────────────────────────────────────── */
+function openShortcut() {
+  const account = DB.get('account', {});
+  const url = account.shortcutKey
+    ? `${WORKER}/resume?key=${account.shortcutKey}&profile=${encodeURIComponent(state.profile)}`
+    : null;
+
+  openSheet('Siri & Shortcuts', openShortcut);
+  document.getElementById('sheetBody').innerHTML = `
+    <p class="hint" style="margin-top:0">Build this once in the Shortcuts app and you get
+       a Home Screen icon, an Action Button target, and a Siri phrase — all resuming
+       ${esc(state.profile)}'s last title in one tap.</p>
+
+    <h2>Your resume link</h2>
+    <div class="card"><div class="row" style="cursor:default">
+      <div class="meta">
+        <div class="t2" style="white-space:normal;word-break:break-all;color:var(--text)">
+          ${url ? esc(url) : 'Sync once to generate your key.'}</div>
+      </div>
+    </div></div>
+    ${url ? `<div class="center">
+      <button class="ghost" style="flex:1" onclick="copyText('${esc(url)}')">Copy link</button>
+      <button class="ghost" style="flex:1" onclick="rotateKey()">New key</button>
+    </div>` : ''}
+
+    <h2>Build the Shortcut</h2>
+    <div class="card">
+      <div class="row" style="cursor:default"><div class="art">1</div>
+        <div class="meta"><div class="t1">Open App</div>
+          <div class="t2">Choose Spotify</div></div></div>
+      <div class="row" style="cursor:default"><div class="art">2</div>
+        <div class="meta"><div class="t1">Wait</div>
+          <div class="t2">2 seconds — lets Spotify register as a device</div></div></div>
+      <div class="row" style="cursor:default"><div class="art">3</div>
+        <div class="meta"><div class="t1">Get Contents of URL</div>
+          <div class="t2">Paste the link above</div></div></div>
+    </div>
+    <p class="hint">Name it something Siri can hear — "Continue listening" works well.
+       Then long-press the Shortcut → <b>Add to Home Screen</b>, or assign it to the
+       Action Button under Settings → Action Button.</p>
+    <p class="hint">Anyone holding that link can resume your playback, so treat it like
+       a password. Tap <b>New key</b> to invalidate the old one.</p>`;
+}
+
+function copyText(text) {
+  navigator.clipboard?.writeText(text)
+    .then(() => toast('Copied'))
+    .catch(() => toast('Select and copy it manually.', true));
+}
+
+async function rotateKey() {
+  try {
+    const r = await worker('/api/shortcut-key', 'POST');
+    const account = DB.get('account', {});
+    account.shortcutKey = r.shortcutKey;
+    DB.set('account', account);
+    toast('New key made — update your Shortcut.');
+    openShortcut();
+  } catch (e) { toast(e.message, true); }
+}
 
 /* ── Device picker ────────────────────────────────────────── */
 async function openDevices() {
@@ -1366,8 +1447,8 @@ function drawWatchlist(results) {
 
   const wl = state.watchlist.length ? state.watchlist.map((w, i) => `
     <div class="row" ${(w.kind === 'artist' || w.kind === 'show') ? `onclick="browseWatch(${i})"` :
-                       (w.kind === 'album' || w.kind === 'audiobook') ? `onclick="openWatched(${i})"` :
-                       'style="cursor:default"'}>
+                       (w.kind === 'album' || w.kind === 'audiobook' || w.kind === 'playlist')
+                         ? `onclick="openWatched(${i})"` : 'style="cursor:default"'}>
       ${w.kind === 'keyword' ? '<div class="art">🔍</div>' : artHTML(w.art)}
       <div class="meta"><div class="t1">${esc(w.name)}</div><div class="t2">${w.kind}</div></div>
       <button class="more" onclick="event.stopPropagation();removeWatch(${i})" aria-label="Remove">✕</button>
@@ -1401,8 +1482,8 @@ async function runSearch() {
   const term = currentQuery.trim();
   if (term.length < 2) return drawWatchlist();
   try {
-    const d = await api('/v1/search?type=artist,album,show,audiobook&limit=8&q='
-      + encodeURIComponent(term));
+    const d = await api('/v1/search?type=artist,album,show,audiobook&limit=8'
+      + (await marketQuery()) + '&q=' + encodeURIComponent(term));
     const pick = list => list || [];
     const out = [
       ...pick(d.artists?.items).map(a => ({
@@ -1424,13 +1505,86 @@ async function runSearch() {
   } catch (e) { toast(e.message, true); }
 }
 
-function addWatch(r) {
-  if (!state.watchlist.some(w => w.uri === r.uri)) {
-    state.watchlist.unshift({ kind: r.kind, id: r.uri, uri: r.uri, name: r.name,
-                              art: r.art, spotifyId: r.id, addedAt: new Date().toISOString() });
-    save();
+function addWatchItem(r) {
+  if (state.watchlist.some(w => w.uri === r.uri)) return false;
+  state.watchlist.unshift({ kind: r.kind, id: r.uri, uri: r.uri, name: r.name,
+                            art: r.art, spotifyId: r.id, addedAt: new Date().toISOString() });
+  save();
+  return true;
+}
+
+function addWatch(r) { addWatchItem(r); runSearch(); }
+
+/* ── Add whatever is playing ──────────────────────────────────
+   Offers each layer Spotify reports: the artist, the album (or podcast or
+   audiobook), and the playlist it is playing from.
+   ──────────────────────────────────────────────────────────── */
+const CONTAINER_LABEL = {
+  album: 'Album — one bookmark for the whole thing',
+  show: 'Podcast — browse and continue any episode',
+  audiobook: 'Audiobook',
+  playlist: 'Playlist'
+};
+
+let addOptions = [];
+
+async function openAddCurrent() {
+  const np = state.nowPlaying;
+  if (!np) return toast('Nothing is playing right now.', true);
+
+  openSheet('Add to watchlist', openAddCurrent);
+  const body = document.getElementById('sheetBody');
+  body.innerHTML = '<div class="center">Loading…</div>';
+
+  const opts = [];
+  if (np.artistURI) {
+    opts.push({ kind: 'artist', uri: np.artistURI, name: np.artistName, art: np.art,
+                sub: 'Artist — follow everything they release' });
   }
-  runSearch();
+  if (np.albumURI) {
+    const kind = np.albumURI.split(':')[1];
+    opts.push({ kind, uri: np.albumURI, name: np.albumName, art: np.art,
+                sub: CONTAINER_LABEL[kind] || kind });
+  }
+  if (np.contextURI && np.contextURI.startsWith('spotify:playlist:')
+      && np.contextURI !== np.albumURI) {
+    // The player reports only a playlist's URI, so fetch its name.
+    let name = 'This playlist', art = null;
+    try {
+      const pl = await api('/v1/playlists/' + np.contextURI.split(':').pop()
+                           + '?fields=name,images');
+      name = pl?.name || name;
+      art = pl?.images?.slice(-1)[0]?.url || null;
+    } catch (e) {}
+    opts.push({ kind: 'playlist', uri: np.contextURI, name, art, sub: 'Playlist' });
+  }
+
+  addOptions = opts;
+
+  const rows = opts.map((o, i) => {
+    const already = state.watchlist.some(w => w.uri === o.uri);
+    return `<div class="row" ${already ? 'style="cursor:default"' : `onclick="addCurrent(${i})"`}>
+      ${o.art ? artHTML(o.art) : '<div class="art">♪</div>'}
+      <div class="meta">
+        <div class="t1">${esc(o.name)}</div>
+        <div class="t2">${esc(o.sub)}</div>
+      </div>
+      ${already ? '<span class="tick">✓</span>'
+                : '<span class="addbtn" style="line-height:44px">＋</span>'}
+    </div>`;
+  }).join('');
+
+  body.innerHTML = `
+    <p class="hint" style="margin-top:0">Add what's playing, so it's one tap away next time.</p>
+    <div class="card">${rows || '<div class="empty">Nothing here to follow.</div>'}</div>`;
+}
+
+function addCurrent(i) {
+  const o = addOptions[i];
+  if (!o) return;
+  addWatchItem({ kind: o.kind, id: o.uri.split(':').pop(), uri: o.uri, name: o.name, art: o.art });
+  toast('Added ' + o.name);
+  openAddCurrent();
 }
 function removeWatch(i) {
   const gone = state.watchlist[i];
@@ -1477,8 +1631,9 @@ async function loadEpisodes() {
   if (browse.done) return;
   const src = browse.source;
   try {
+    const mk = await marketQuery();
     const path = src.kind === 'show'
-      ? `/v1/shows/${src.id}/episodes?limit=50&offset=${browse.offset}`
+      ? `/v1/shows/${src.id}/episodes?limit=50&offset=${browse.offset}${mk}`
       : `/v1/artists/${src.id}/albums?include_groups=album,single&limit=50&offset=${browse.offset}`;
 
     const d = await api(path);
@@ -1535,12 +1690,20 @@ function openEpisode(i) {
 
 /* ── Boot ─────────────────────────────────────────────────── */
 (async function init() {
-  await handleRedirect();
-  state.signedIn = !!DB.get('refresh');
-  autoArchive();
-  render();
-  if (state.signedIn) { startPolling(); reconcile(); }
-  if (GH.token) sync();
+  try {
+    captureSession();
+    state.signedIn = !!session();
+    try { autoArchive(); } catch (e) { console.warn('autoArchive', e); }
+    render(true);
+  } catch (e) {
+    showFatal(e);
+    return;
+  }
+  if (state.signedIn) {
+    await sync();          // server is the source of truth on open
+    startPolling();
+    reconcile();
+  }
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});

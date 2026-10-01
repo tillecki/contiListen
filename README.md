@@ -1,195 +1,191 @@
 # ContiListen
 
-Bookmarks your position in Spotify Hörspiele (*Die drei ???*, *Sherlock Holmes*) and
-resumes exactly where you stopped. Spotify only does this for podcasts, not for
-albums.
+Bookmarks your position in Spotify Hörspiele, audiobooks and podcasts, and resumes
+exactly where you stopped. Spotify only does this for podcasts, not for albums.
 
-A web page, so nothing gets installed — it works on a locked-down work phone.
+The app is a web page you add to your Home Screen — nothing gets installed, so it
+works on a locked-down work phone. A small Cloudflare Worker holds your Spotify login,
+merges bookmarks across devices, polls playback every minute, and does the one thing a
+web page can't: **wait for Spotify to finish launching before resuming.**
 
-**You need:** Spotify Premium, a GitHub account, and the Spotify app open on some
-device when you press play.
+Multiple people can sign in. Each gets their own bookmarks; nobody sees anyone else's.
 
----
-
-# Part 1 — Get it working
-
-About 10 minutes. Do all five steps.
-
-## 1. Create a Spotify app
-
-Go to <https://developer.spotify.com/dashboard> → **Create app**.
-
-- Name: anything
-- Redirect URI: leave blank for now
-- APIs used: tick **Web API**
-
-Click into the app → **Settings** → copy the **Client ID**. Keep the tab open.
-
-## 2. Put the files on GitHub
-
-1. Create a **new repository** called `contilisten`. Make it **Public**.
-2. **Add file → Upload files** → drag in `index.html` and `sw.js` → **Commit**.
-3. **Settings → Pages** → Source: *Deploy from a branch* → Branch `main`, folder
-   `/ (root)` → **Save**.
-
-Wait a minute and reload. Your address appears at the top:
-
-```
-https://YOURNAME.github.io/contilisten/
-```
-
-Copy it, including the trailing slash.
-
-## 3. Register that address with Spotify
-
-Back in the Spotify tab: **Settings → Edit** → under **Redirect URIs** paste your
-Pages address exactly → **Add** → **Save**.
-
-It must match character for character. A missing trailing slash counts as different.
-
-## 4. Add your Client ID
-
-On GitHub, open `index.html` → pencil icon → find this near the top:
-
-```js
-const CLIENT_ID = 'PASTE_YOUR_SPOTIFY_CLIENT_ID';
-```
-
-Paste your Client ID between the quotes. **Commit changes.** Wait a minute.
-
-## 5. Open it on your phone
-
-1. Open your Pages address in **Safari** (must be Safari, not Chrome).
-2. Tap **Connect Spotify** and approve.
-3. Share button → **Add to Home Screen**.
-
-Done. Play something in Spotify, then open ContiListen — it appears under
-**Continue**. Tap it to resume.
+**You need:** Spotify Premium, a GitHub account (free hosting), and a Cloudflare
+account (free).
 
 ---
 
-# Part 2 — Sync your phone and laptop
+# Part 1 — The Worker
 
-Optional, 5 minutes. Without this, each browser keeps its own separate list.
+This is the backend. Do it first; the app needs its address.
 
-1. Go to <https://github.com/settings/tokens> → **Tokens (classic)** →
-   **Generate new token (classic)**.
-2. Note: `contilisten`. Expiration: *No expiration*.
-3. Tick **only** the `gist` checkbox. Nothing else.
-4. **Generate token** and copy it (starts with `ghp_`).
-5. In ContiListen: **⋯ → Connect**, paste, tap **Connect**.
+## 1. Create the Spotify app
 
-On your other devices, paste the same token. They find each other automatically.
+<https://developer.spotify.com/dashboard> → **Create app**. Tick **Web API**.
+From **Settings**, copy both the **Client ID** and the **Client secret**.
 
-> Must be a *classic* token. Fine-grained tokens can't access gists.
+Leave the Redirect URI blank for now — you'll add it in step 4.
 
----
-
-# Part 3 — Record position while the app is closed
-
-Optional, 15 minutes. Without this, your position is only saved while ContiListen is
-open. With it, a job runs every 5 minutes and saves your position even when nothing
-is open.
-
-## 1. Get your client secret
-
-Spotify dashboard → your app → **Settings** → **View client secret** → copy it.
-
-On the same page, **Edit** and add a second redirect URI:
-
-```
-http://127.0.0.1:8080/callback
-```
-
-## 2. Run the setup script once, on your computer
-
-`bootstrap_token.py` ships alongside this README. Save it anywhere — your Downloads
-folder is fine. **It does not go in your repo**; it runs once and you can delete it
-afterwards.
-
-Open Terminal, `cd` to wherever you saved it, then:
+## 2. Set up the project
 
 ```bash
-export SPOTIFY_CLIENT_ID=your_client_id
-export SPOTIFY_CLIENT_SECRET=your_client_secret
-python3 bootstrap_token.py
+cd worker
+npm init -y
+npm install --save-dev wrangler
+npx wrangler login
+npx wrangler d1 create contilisten
 ```
 
-Your browser opens, you approve, and the terminal prints a long token between two
-lines of `=`. Copy it.
+> Installed into the project rather than globally. `npm install -g` fails on macOS
+> with `EACCES: permission denied, mkdir '/usr/local/lib/node_modules/...'` because
+> your user doesn't own `/usr/local`. Don't `sudo` it — that leaves root-owned files
+> that break later installs. A local install also pins the version to the project,
+> which you want anyway.
 
-If Terminal says `command not found: python3`, install Python from
-<https://www.python.org/downloads/> and try again.
+That prints a `database_id`. Open `wrangler.toml` and fill in three things:
 
-## 3. Upload the job files
+- `database_id` — from the command above
+- `SPOTIFY_CLIENT_ID` — from the dashboard
+- `APP_ORIGIN` — your GitHub Pages address from Part 2, e.g.
+  `https://yourname.github.io/contilisten/`
 
-Upload to your repo, keeping the folder structure:
+If you haven't done Part 2 yet, come back and fix `APP_ORIGIN` afterwards.
 
-- `scripts/poll.py`
-- `.github/workflows/poller.yml`
+## 3. Create the tables and deploy
 
-## 4. Add the secrets
+```bash
+npx wrangler d1 execute contilisten --remote --file=./schema.sql
+npx wrangler secret put SPOTIFY_CLIENT_SECRET     # paste when prompted
+npx wrangler deploy
+```
 
-Repo → **Settings → Secrets and variables → Actions → New repository secret**.
-Add these four:
+Deploy prints your Worker address, something like
+`https://contilisten.yourname.workers.dev`. Copy it.
 
-| Name | Value |
-|---|---|
-| `SPOTIFY_CLIENT_ID` | from the dashboard |
-| `SPOTIFY_CLIENT_SECRET` | from the dashboard |
-| `SPOTIFY_REFRESH_TOKEN` | printed by the script |
-| `GIST_TOKEN` | the same `ghp_` token from Part 2 |
+Check it: opening `https://your-worker.workers.dev/health` should return
+`{"ok":true,...}`.
 
-## 5. Start it
+## 4. Tell Spotify about the Worker
 
-Play something in Spotify. Then repo → **Actions** tab → **ContiListen position
-poller** → **Run workflow**. Open the run and check the log — it prints what it saw.
+Dashboard → your app → **Settings** → **Edit** → **Redirect URIs**, add exactly:
 
-From now on it runs by itself every 5 minutes.
+```
+https://your-worker.workers.dev/auth/callback
+```
 
-> **Keep the repo public.** Private repos only get 2,000 free Action minutes a month
-> and this would exceed that. Your secrets stay encrypted either way.
->
-> GitHub switches off scheduled jobs after 60 days of no repo activity and emails
-> you. One click in the Actions tab restarts it.
+The client secret lives only in the Worker, so your phone never holds Spotify
+credentials — just a session token you can revoke.
+
+---
+
+# Part 2 — The app
+
+## 1. Put it on GitHub
+
+1. New repository called `contilisten`, **Public**.
+2. **Add file → Upload files** → drag in `index.html` and `sw.js` → **Commit**.
+3. **Settings → Pages** → Source *Deploy from a branch* → `main`, folder `/ (root)`.
+
+Your address appears after a minute: `https://yourname.github.io/contilisten/`
+
+## 2. Point it at the Worker
+
+Edit `index.html` on GitHub, near the top:
+
+```js
+const WORKER = 'https://contilisten.yourname.workers.dev';   // no trailing slash
+```
+
+Commit. Make sure `APP_ORIGIN` in `wrangler.toml` matches your Pages address, and
+`npx wrangler deploy` again if you changed it.
+
+## 3. Install it
+
+Open the Pages address in **Safari** (must be Safari), tap **Sign in with Spotify**,
+approve. Then Share → **Add to Home Screen**.
+
+---
+
+# Part 3 — Siri and the Home Screen button
+
+This is what makes resuming a single tap. A Shortcut can launch Spotify and *keep
+running*; a web page gets suspended the moment you switch apps.
+
+In the app: **⋯ → Siri & Shortcuts**, and copy your resume link.
+
+Then in the **Shortcuts** app → **+** → add three actions:
+
+| | Action | Setting |
+|---|---|---|
+| 1 | **Open App** | Spotify |
+| 2 | **Wait** | 2 seconds |
+| 3 | **Get Contents of URL** | paste your resume link |
+
+Name it **Continue listening**. That name becomes the Siri phrase — *"Hey Siri,
+Continue listening"*.
+
+Then pick your favourites:
+
+- Long-press the Shortcut → **Add to Home Screen** for an icon
+- Settings → **Action Button** → Shortcut (iPhone 15 Pro and later)
+- Settings → Accessibility → Touch → **Back Tap** → double tap
+- Add a **Shortcuts widget** to the Home Screen — a real widget, no Developer Mode
+
+Tap it and you can pocket the phone. Spotify launches, the Worker notices it come
+online, and playback starts at your saved position.
+
+> Anyone with that link can start your playback, so treat it as a password. **New
+> key** in the same screen invalidates the old one.
 
 ---
 
 # Using it
 
-**Continue** — tap any row to resume. It starts 15 seconds early so you don't come
-back mid-sentence (change under **⋯ → Rewind on resume**).
+**Continue** — tap any row to resume, starting 15 seconds early so you don't come
+back mid-sentence (**⋯ → Rewind on resume**).
 
-**👤 chip** — switch between listeners. Each profile keeps its own bookmarks, so you
-and your partner won't overwrite each other in the same series. Profiles created on
-one device appear on the others after a sync — no need to retype the name.
+**👤 chip** — switch listeners. Each profile keeps its own bookmarks, so you and a
+partner sharing one Spotify account don't overwrite each other. Separate Spotify
+accounts are separate logins and never mix.
 
-**🔈 chip** — choose where playback goes. Pin your phone here if you're tired of
-audio landing on the kitchen speaker. Speakers are never picked automatically.
+**🔈 chip** — choose the playback device, or pin one. Speakers are never picked
+automatically; an idle Echo stays "active" for hours, which is how audio ends up in
+the wrong room.
 
-**★ button** — search and follow an **artist** (get their full release list), a
-**podcast** (get its episode list), an **album**, an **audiobook**, or a plain
-keyword. Tap anything in the list to start or continue it.
+**★ next to Playing now** — follow what's playing: the artist, the album, the
+podcast, or the playlist it's playing from.
 
-**⋯ on a row** — Continue, **Jump back to earlier**, Mark as finished, Forget.
+**★ in the header** — search and follow artists, podcasts, albums, audiobooks, or
+plain keywords.
+
+**⋯ on a row** — Continue, **Jump back to earlier**, switch whole-book vs this-part
+progress, mark finished, forget.
 
 **Jump back to earlier** is the fell-asleep fix. Positions are saved as breadcrumbs
-while you listen, so if you doze off in chapter 12 and Spotify runs on to chapter 40,
-you can pick "22:35 · Chapter 12" and carry on from there.
+while you listen, so if you doze off in chapter 12 and Spotify runs to chapter 40,
+pick "22:35 · Chapter 12" and carry on.
 
-Episodes past 97% move themselves into a collapsed **Finished** list.
+Rows show a percentage. Hörspiele and audiobooks measure across the whole thing
+("Chapter 17 of 42"); podcasts measure within the episode. Spotify is inconsistent
+about which is which, so ⋯ lets you switch.
 
-**Works with podcasts and audiobooks too**, not just Hörspiele. They're bookmarked
-differently because they mean different things:
+Episodes past 97% move into a collapsed **Finished** list.
 
-| | One bookmark per | Progress shown |
-|---|---|---|
-| Hörspiel / album | the whole album | across all chapters — "Chapter 17 of 42 · 40%" |
-| Audiobook | the whole book | across all chapters |
-| Podcast | each episode | within that episode |
+---
 
-Every row shows a percentage. It appears a moment after a new item is added, once
-the chapter list has been fetched and cached.
+# How it holds together
+
+| | |
+|---|---|
+| **Sync** | Every bookmark is its own row. The Worker keeps the newest of each, so two devices editing different titles can never collide. Closing the page mid-edit no longer loses the write. |
+| **Recording** | The Worker polls Spotify every minute for everyone signed in, whether or not anything is open. The app polls every 5s while on screen for finer detail. |
+| **Resume** | The Worker waits up to 18 seconds for your device to register, then transfers and seeks. This is why one tap is enough. |
+| **Credentials** | Spotify refresh tokens never leave the Worker. Your phone holds a session token and a shortcut key, both revocable. |
+| **Chapter maps** | Fetched once, cached server-side, shared by everyone. |
+
+Free-tier headroom is comfortable: the cron uses 1,440 of 100,000 daily requests,
+and D1 gives 500 MB where you need kilobytes. Waiting on network doesn't count
+against Worker CPU time, so the resume loop is nearly free.
 
 ---
 
@@ -197,17 +193,16 @@ the chapter list has been fetched and cached.
 
 | What you see | Fix |
 |---|---|
-| `INVALID_CLIENT: Invalid redirect URI` | Pages address and Spotify redirect URI don't match. Check the trailing slash. |
-| Sign-in loops back to the start | `CLIENT_ID` in `index.html` is still the placeholder. |
-| "Spotify Premium is required" | Free account, or you authorised the wrong Spotify account. |
-| Everything fails with 403 | Your Spotify account isn't on the app's allowlist. Dashboard → Settings → **User Management** → add the email. Development mode allows five people. |
-| "No Spotify device found" | Spotify isn't open anywhere. Tap **Open Spotify here** in the 🔈 menu, then try again. |
+| `INVALID_CLIENT: Invalid redirect URI` | The Redirect URI must be your **Worker** address + `/auth/callback`, not the Pages address. |
+| Sign-in returns with `#error=bad_state` | Took longer than an hour, or the Worker redeployed mid-login. Just try again. |
+| Sign-in works, then everything 401s | `APP_ORIGIN` in `wrangler.toml` doesn't match your Pages address exactly, so CORS blocks it. Fix and redeploy. |
+| "Spotify never came online" | Spotify wasn't installed or was force-quit. Open it once manually. |
+| Everything fails with 403 | Your Spotify account isn't on the app's allowlist. Dashboard → Settings → **User Management**. Development mode allows five people. |
+| "Spotify Premium is required" | Free accounts can't be controlled by the API. |
 | Playback goes to the wrong speaker | Pin the right device via the 🔈 chip. |
-| Bookmarks disappeared | Safari clears site data after ~7 days of not visiting. Set up Part 2 and it's recoverable. |
-| No percentage on a row | The chapter list is still loading, or Spotify wouldn't return it. Wait a few seconds; ⋯ → **Clear album cache** forces a retry. |
-| A profile is missing on a new device | Connect sync (Part 2) on that device first, then reopen the 👤 menu. |
-| GitHub token rejected | Must be a classic token with the `gist` scope. Fine-grained tokens don't work. |
+| No percentage on a row | The chapter list is still loading, or Spotify won't return it. ⋯ → **Clear chapter cache** forces a retry. |
+| Audiobook shows only the current chapter | ⋯ on that row → **Measure progress across the whole book**. |
+| Shortcut does nothing | Check the link still matches; pressing **New key** invalidates the old one. |
 
-**Position is up to 5 minutes behind** if you use Part 3, because that's GitHub's
-minimum schedule and runs are often later. Without Part 3, position only saves while
-the app is open.
+To see what the Worker is doing: `npx wrangler tail` streams live logs, including
+every cron run.

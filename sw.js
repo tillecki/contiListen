@@ -6,8 +6,13 @@ const CACHE = 'contilisten-v1';
 const SHELL = ['./', './index.html'];
 
 self.addEventListener('install', event => {
+  // addAll rejects the whole install if any URL 404s, which would leave the
+  // worker stuck. Cache what we can and move on.
   event.waitUntil(
-    caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())
+    caches.open(CACHE)
+      .then(c => Promise.allSettled(SHELL.map(u => c.add(u))))
+      .then(() => self.skipWaiting())
+      .catch(() => self.skipWaiting())
   );
 });
 
@@ -45,8 +50,11 @@ self.addEventListener('fetch', event => {
   event.respondWith(
     fetch(request)
       .then(res => {
-        const copy = res.clone();
-        caches.open(CACHE).then(c => c.put(request, copy));
+        // Never cache an error page — that is how a blank screen becomes permanent.
+        if (res && res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE).then(c => c.put(request, copy));
+        }
         return res;
       })
       .catch(() => caches.match(request).then(hit => hit || caches.match('./index.html')))
