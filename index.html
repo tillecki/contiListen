@@ -633,6 +633,7 @@ function adoptState(remote) {
     state.mode = remote.settings.mode || state.mode;
     if (remote.settings.rewindSec != null) DB.set('rewindSec', remote.settings.rewindSec);
     DB.set('pinnedDevice', remote.settings.pinnedDevice || null);
+    DB.set('sleepUntil', remote.settings.sleepUntil || null);
   }
   if (remote.user) {
     DB.set('account', remote.user);
@@ -1040,8 +1041,10 @@ function render(force) {
       <button class="iconbtn" onclick="openSettings()" title="Settings">⋯</button>
     </header>
     <div class="chips">
-      <div class="chip" onclick="openProfiles()">👤 <b>${esc(state.profile)}</b></div>
-      <div class="chip" onclick="openDevices()">🔈 <b>${pinned ? esc(pinned.name) : 'Automatic'}</b></div>
+      <div class="chip" onclick="openProfiles()">👤 <b>${esc(state.profile)}</b>
+        <span style="opacity:.45">›</span></div>
+      <div class="chip" onclick="openDevices()"><span style="opacity:.45">‹</span>
+        🔈 <b>${pinned ? esc(pinned.name) : 'Automatic'}</b></div>
     </div>
     ${nowHTML}
     <h2>Continue</h2>
@@ -1062,6 +1065,32 @@ function untombstone(id) {
   delete t[id];
   DB.set('tombstones', t);
 }
+
+/* ── Swipe shortcuts ──────────────────────────────────────────
+   The two chips are at the top of a list you're usually scrolled down inside.
+   A horizontal swipe reaches them from anywhere; nothing else in the app
+   scrolls sideways, so there's nothing to conflict with.
+   ──────────────────────────────────────────────────────────── */
+(function () {
+  let x0 = null, y0 = null;
+
+  addEventListener('touchstart', e => {
+    if (sheet().open || !state.signedIn) { x0 = null; return; }
+    x0 = e.touches[0].clientX;
+    y0 = e.touches[0].clientY;
+  }, { passive: true });
+
+  addEventListener('touchend', e => {
+    if (x0 === null || sheet().open) return;
+    const dx = e.changedTouches[0].clientX - x0;
+    const dy = e.changedTouches[0].clientY - y0;
+    x0 = null;
+    // Generous horizontal threshold, tight vertical one, so a slightly slanted
+    // scroll never fires this.
+    if (Math.abs(dx) < 70 || Math.abs(dy) > 45) return;
+    dx < 0 ? openDevices() : openProfiles();
+  }, { passive: true });
+})();
 
 /* ── Per-bookmark actions ─────────────────────────────────── */
 function openBookmark(id) {
@@ -1209,6 +1238,8 @@ function openProfiles() {
       <div class="art">👤</div>
       <div class="meta"><div class="t1">${esc(name)}</div>
         <div class="t2">${count} bookmark${count === 1 ? '' : 's'}</div></div>
+      <button class="more" onclick="event.stopPropagation();renameProfile('${safe}')"
+              aria-label="Rename">✎</button>
       ${name === state.profile ? '<span class="tick">✓</span>'
         : (knownProfiles().length > 1
           ? `<button class="more" onclick="event.stopPropagation();deleteProfile('${safe}')">✕</button>`
@@ -1223,9 +1254,30 @@ function openProfiles() {
       <input type="text" id="pname" placeholder="e.g. Anna">
       <button class="ghost" onclick="addProfile()">Add</button>
     </div>
-    <p class="hint">Each profile keeps its own bookmarks, so you don't overwrite each other
-       in the same series. Which profile is active is remembered per device, so your phone
-       and your partner's can differ while still sharing one gist.</p>`;
+    <p class="hint">Each profile keeps its own bookmarks, so you don't overwrite each
+       other in the same series. Which one is active is remembered per device, so your
+       phone and your partner's can differ while sharing one account. Tap ✎ to rename —
+       every bookmark moves with it.</p>`;
+}
+
+/** Renaming moves every bookmark, since a bookmark's identity includes its owner —
+    so this goes through the server rather than being a local relabel. */
+async function renameProfile(from) {
+  const to = prompt('Rename this profile', from);
+  if (to === null) return;
+  const name = to.trim();
+  if (!name || name === from) return;
+
+  try {
+    const remote = await worker('/api/profile/rename', 'POST', { from, to: name });
+    adoptState(remote);
+    if (state.profile === from) { state.profile = name; DB.set('profile', name); }
+    toast('Renamed to ' + name);
+    openProfiles();
+  } catch (e) {
+    toast(e.status === 409 ? 'You already have a profile with that name.'
+                           : (e.message || 'Rename failed.'), true);
+  }
 }
 
 function pickProfile(name) {
@@ -1319,6 +1371,21 @@ function openSettings() {
        never overwrite each other. Your Spotify login stays there too — this device
        only holds a session token.</p>
 
+    <h2>Sleep timer</h2>
+    <div class="seg">
+      ${[0, 15, 30, 45, 60].map(n => {
+        const active = n === 0 ? sleepLeftMs() <= 0
+                               : Math.abs(sleepLeftMs() - n * 60000) < 90000;
+        return `<button class="${active ? 'on' : ''}" onclick="setSleep(${n})">${
+          n ? n + 'm' : 'Off'}</button>`;
+      }).join('')}
+    </div>
+    <p class="hint">${sleepLabel()
+      ? `<b style="color:var(--accent)">${sleepLabel()}</b> — your position is saved
+         just before playback stops.`
+      : 'Pauses Spotify after the chosen time. Runs on the server, so it still works '
+        + 'with your phone asleep and nothing open.'}</p>
+
     <h2>Rewind on resume</h2>
     <div class="seg">
       ${[0, 5, 15, 30].map(n => `<button class="${DB.get('rewindSec', 15) === n ? 'on' : ''}"
@@ -1349,13 +1416,48 @@ function openSettings() {
 }
 function setMode(m) { state.mode = m; save(); openSettings(); }
 
+/* ── Sleep timer ──────────────────────────────────────────────
+   Prevention, where "Jump back to earlier" is the cure. The server holds the
+   deadline and its minute-by-minute poll does the pausing, so it still works
+   with the phone asleep and nothing open — and the position is recorded on the
+   same pass, just before playback stops.
+   ──────────────────────────────────────────────────────────── */
+const sleepLeftMs = () => {
+  const until = DB.get('sleepUntil', null);
+  return until ? until - Date.now() : 0;
+};
+
+async function setSleep(minutes) {
+  try {
+    const r = await worker('/api/sleep', 'POST', { minutes });
+    DB.set('sleepUntil', r.sleepUntil || null);
+    toast(minutes > 0 ? `Pausing in ${minutes} minutes` : 'Sleep timer off');
+    openSettings();
+  } catch (e) { toast(e.message || 'Could not set the timer.', true); }
+}
+
+function sleepLabel() {
+  const left = sleepLeftMs();
+  if (left <= 0) return null;
+  const mins = Math.max(1, Math.round(left / 60000));
+  return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m left` : `${mins} min left`;
+}
+
 /* ── Siri and Shortcuts ───────────────────────────────────────
    A Shortcut can launch Spotify and *keep running*, which a web page cannot.
    Paired with the Worker waiting for the device to appear, that turns resume
    into a single tap from the Home Screen, the Action Button or "Hey Siri".
    ──────────────────────────────────────────────────────────── */
+let lockDevices = DB.get('lastDevices', []);
+
 function openShortcut() {
   const account = DB.get('account', {});
+  // Refresh in the background; the sheet redraws itself when it lands.
+  listDevices().then(d => {
+    lockDevices = d.filter(x => !NEAR.has(x.type) || x.type === 'Computer');
+    DB.set('lastDevices', lockDevices);
+    if (sheet().open && refreshSheet === openShortcut) openShortcut();
+  }).catch(() => {});
   const url = account.shortcutKey
     ? `${WORKER}/resume?key=${account.shortcutKey}&profile=${encodeURIComponent(state.profile)}`
     : null;
@@ -1393,6 +1495,25 @@ function openShortcut() {
     <p class="hint">Name it something Siri can hear — "Continue listening" works well.
        Then long-press the Shortcut → <b>Add to Home Screen</b>, or assign it to the
        Action Button under Settings → Action Button.</p>
+
+    <h2>A version that works locked</h2>
+    <p class="hint" style="margin-top:0">iOS won't launch an app from the lock screen
+       without unlocking, so step 1 above is what blocks you. Drop it and the Shortcut
+       becomes a single <b>Get Contents of URL</b> — which Siri will run locked.</p>
+    <p class="hint">That only works if Spotify is already awake somewhere, so point it
+       at a device that never sleeps. Pick one and you get a link that resumes there
+       every time, hands-free:</p>
+    <div class="card">${(lockDevices || []).length ? lockDevices.map(d => `
+      <div class="row" onclick="copyText('${esc(url || '')}&device=${esc(d.id)}')">
+        <div class="art">${deviceIcon(d.type)}</div>
+        <div class="meta"><div class="t1">${esc(d.name)}</div>
+          <div class="t2">Tap to copy a link that always plays here</div></div>
+        <div class="chev">⧉</div>
+      </div>`).join('')
+      : '<div class="empty">Open the 🔈 menu once so your devices are known.</div>'}</div>
+    <p class="hint">Name that one for the room — "Play in the kitchen" — and Siri can
+       start it without you touching the phone. On your own phone it works locked too,
+       as long as Spotify is still registered from earlier listening.</p>
     <p class="hint">Anyone holding that link can resume your playback, so treat it like
        a password. Tap <b>New key</b> to invalidate the old one.</p>`;
 }
@@ -1424,15 +1545,22 @@ async function openDevices() {
 
 function drawDevices(list) {
   const pinned = DB.get('pinnedDevice');
+  const playing = !!state.nowPlaying;
+
+  // Tapping the row moves playback there now; the star pins it for every future
+  // resume. Two different intentions, so two different targets.
   const rows = list.map(d => {
+    const safe = esc(d.name).replace(/'/g, '&#39;');
     const on = pinned && pinned.id === d.id;
-    return `<div class="row" onclick="pinDevice('${d.id}','${esc(d.name).replace(/'/g,"&#39;")}')">
+    return `<div class="row" onclick="moveTo('${d.id}','${safe}')">
       <div class="art">${deviceIcon(d.type)}</div>
       <div class="meta">
         <div class="t1">${esc(d.name)}</div>
-        <div class="t2">${esc(d.type)}${d.is_active ? ' · active now' : ''}</div>
+        <div class="t2">${esc(d.type)}${d.is_active ? ' · active now' : ''}${on ? ' · pinned' : ''}</div>
       </div>
-      ${on ? '<span class="tick">✓</span>' : ''}
+      <button class="more" style="${on ? 'color:var(--accent)' : ''}"
+              onclick="event.stopPropagation();pinDevice('${d.id}','${safe}')"
+              aria-label="Pin">${on ? '★' : '☆'}</button>
     </div>`;
   }).join('');
 
@@ -1448,6 +1576,9 @@ function drawDevices(list) {
       </div>
     </div>
     <h2>Your devices</h2>
+    <p class="hint" style="margin:0 2px 9px">${playing
+      ? 'Tap a device to move what\u2019s playing there now. Tap the star to pin it.'
+      : 'Tap a device to start your last title there. Tap the star to pin it.'}</p>
     <div class="card">${rows || `<div class="empty"><b>Nothing awake</b>
       Spotify only lists a device while its app is open or recently used.</div>`}</div>
     <div class="center" style="gap:8px">
@@ -1462,9 +1593,41 @@ function drawDevices(list) {
 }
 
 function pinDevice(id, name) {
-  DB.set('pinnedDevice', { id, name });
-  toast('Playback will go to ' + name);
+  const current = DB.get('pinnedDevice');
+  if (current && current.id === id) {          // tapping the star again unpins
+    DB.del('pinnedDevice');
+    toast('Unpinned — back to automatic');
+  } else {
+    DB.set('pinnedDevice', { id, name });
+    toast('Every resume will go to ' + name);
+  }
+  scheduleSync();
   openDevices();
+}
+
+/** Hand current playback to another device without restarting it. With nothing
+    playing, start the latest bookmark there instead. */
+async function moveTo(id, name) {
+  closeSheet();
+  state.busy = true; render();
+  try {
+    if (state.nowPlaying) {
+      const r = await worker('/api/transfer', 'POST', { deviceId: id });
+      toast(r?.ok ? 'Moved to ' + name : "Couldn't move playback to " + name, !r?.ok);
+      setTimeout(poll, 1200);
+    } else {
+      const b = mine().find(x => !x.archived);
+      if (!b) { toast('Nothing saved to play yet.', true); return; }
+      const r = await worker('/api/resume-sync', 'POST',
+        { profile: b.profile || state.profile, key: b.key || b.id, device: id });
+      toast(r?.ok ? `Continuing ${b.albumName} on ${name}` : `${name} didn't respond.`, !r?.ok);
+      setTimeout(poll, 1500);
+    }
+  } catch (e) {
+    toast(e.message || 'Failed.', true);
+  } finally {
+    state.busy = false; render();
+  }
 }
 function clearPin() { DB.del('pinnedDevice'); toast('Back to automatic'); openDevices(); }
 

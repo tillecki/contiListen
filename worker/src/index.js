@@ -228,9 +228,14 @@ async function handleCallback(env, url) {
     ).bind(me.id, me.display_name || me.id, t.refresh_token, t.access_token, expires,
            me.country || null, randomHex(20), now(), now()).run();
 
+    // Naming the first profile "Me" next to an account called Max reads as two
+    // different people. Use the Spotify name for both.
+    const firstProfile = (me.display_name || '').trim() || 'Me';
     await env.DB.prepare(
       'INSERT OR IGNORE INTO profiles (user_id, name, added_at) VALUES (?, ?, ?)'
-    ).bind(me.id, 'Me', now()).run();
+    ).bind(me.id, firstProfile, now()).run();
+    await env.DB.prepare('UPDATE users SET default_profile = ? WHERE id = ?')
+      .bind(firstProfile, me.id).run();
   }
 
   const session = randomHex(32);
@@ -327,7 +332,8 @@ async function loadState(env, user) {
     settings: {
       mode: user.mode || 'everything',
       rewindSec: user.rewind_sec ?? 15,
-      pinnedDevice: user.pinned_device ? JSON.parse(user.pinned_device) : null
+      pinnedDevice: user.pinned_device ? JSON.parse(user.pinned_device) : null,
+      sleepUntil: user.sleep_until || null
     },
     profiles: (profiles.results || []).map(p => p.name),
     bookmarks: (bookmarks.results || []).map(rowToBookmark),
@@ -535,7 +541,7 @@ function chooseDevice(devices, pinnedId, eager) {
   return eager ? null : [...devices].sort(byActive)[0] || null;
 }
 
-async function doResume(env, user, { profile, key }) {
+async function doResume(env, user, { profile, key, device }) {
   const wanted = profile || user.default_profile || 'Me';
 
   const row = key
@@ -552,7 +558,9 @@ async function doResume(env, user, { profile, key }) {
   const b = rowToBookmark(row);
   const rewind = (user.rewind_sec ?? 15) * 1000;
   const position = Math.max(0, b.positionMs - rewind);
-  const pinned = user.pinned_device ? JSON.parse(user.pinned_device)?.id : null;
+  // An explicit device beats the pin, so one Shortcut can target the kitchen
+  // speaker while the app still defaults to your phone.
+  const pinned = device || (user.pinned_device ? JSON.parse(user.pinned_device)?.id : null);
 
   // Spotify takes a few seconds to register after launching. Wait it out.
   const GRACE = RESUME_TRIES - 5;      // after this, settle for anything
@@ -594,6 +602,22 @@ async function doResume(env, user, { profile, key }) {
       }
 
       if (res.ok || res.status === 204) {
+        // Playing on one device doesn't always wrest control from another that was
+        // already going. Verify, and take over properly if it didn't land.
+        await sleep(700);
+        try {
+          const nowOn = await spotifyJSON(env, user, '/v1/me/player');
+          if (nowOn?.device?.id && nowOn.device.id !== target.id) {
+            await spotify(env, user, '/v1/me/player', {
+              method: 'PUT',
+              body: JSON.stringify({ device_ids: [target.id], play: true })
+            });
+            await sleep(400);
+            await spotify(env, user, `/v1/me/player/play?device_id=${target.id}`,
+              { method: 'PUT', body: JSON.stringify(payload) });
+          }
+        } catch (e) { /* best effort; playback already started somewhere */ }
+
         return { ok: true, device: target.name, album: b.albumName,
                  positionMs: position, waitedMs: attempt * RESUME_GAP_MS };
       }
@@ -726,10 +750,18 @@ async function pollAll(env) {
 
   for (const user of list) {
     try {
+      // Record first, then pause — so the bookmark lands before playback stops.
       const r = await recordNowPlaying(env, user);
       console.log(`cron ${user.id}:`, r.recorded
         ? `saved "${r.album}" at ${Math.round(r.positionMs / 1000)}s`
         : r.reason);
+
+      if (user.sleep_until && now() >= user.sleep_until) {
+        await spotify(env, user, '/v1/me/player/pause', { method: 'PUT' });
+        await env.DB.prepare('UPDATE users SET sleep_until = NULL WHERE id = ?')
+          .bind(user.id).run();
+        console.log(`cron ${user.id}: sleep timer paused playback`);
+      }
     } catch (e) {
       console.log('cron failed for', user.id, e.message);
     }
@@ -759,9 +791,12 @@ async function router(request, env, ctx) {
 
     const profile = url.searchParams.get('profile') || undefined;
     const key = url.searchParams.get('id') || undefined;
+    // Lets a lock-screen Shortcut target an always-on speaker, which needs no
+    // unlocking because nothing has to be launched.
+    const device = url.searchParams.get('device') || undefined;
 
     // Answer instantly so Siri isn't left hanging; keep working in the background.
-    ctx.waitUntil(doResume(env, user, { profile, key }));
+    ctx.waitUntil(doResume(env, user, { profile, key, device }));
     return json({ ok: true, queued: true, message: 'Resuming…' }, env);
   }
 
@@ -814,6 +849,57 @@ async function router(request, env, ctx) {
   if (path === '/api/resume-sync' && request.method === 'POST') {
     const body = await request.json().catch(() => ({}));
     return json(await doResume(env, user, body), env);
+  }
+
+  if (path === '/api/transfer' && request.method === 'POST') {
+    const { deviceId } = await request.json().catch(() => ({}));
+    if (!deviceId) return fail(env, 400, 'deviceId required');
+
+    const res = await spotify(env, user, '/v1/me/player', {
+      method: 'PUT',
+      body: JSON.stringify({ device_ids: [deviceId], play: true })
+    });
+    if (!res.ok && res.status !== 204) {
+      return json({ ok: false, status: res.status }, env);
+    }
+    return json({ ok: true }, env);
+  }
+
+  if (path === '/api/sleep' && request.method === 'POST') {
+    const { minutes } = await request.json().catch(() => ({}));
+    const until = minutes > 0 ? now() + minutes * 60000 : null;
+    await env.DB.prepare('UPDATE users SET sleep_until = ? WHERE id = ?')
+      .bind(until, user.id).run();
+    return json({ sleepUntil: until }, env);
+  }
+
+  /* Renaming moves every row, because a bookmark's identity includes its owner. */
+  if (path === '/api/profile/rename' && request.method === 'POST') {
+    const { from, to } = await request.json().catch(() => ({}));
+    const target = (to || '').trim();
+    if (!from || !target) return fail(env, 400, 'from and to required');
+    if (from === target) return json({ ok: true }, env);
+
+    const clash = await env.DB.prepare(
+      'SELECT 1 FROM profiles WHERE user_id = ? AND name = ?'
+    ).bind(user.id, target).first();
+    if (clash) return fail(env, 409, 'a profile with that name already exists');
+
+    await env.DB.batch([
+      env.DB.prepare('UPDATE bookmarks SET profile = ? WHERE user_id = ? AND profile = ?')
+        .bind(target, user.id, from),
+      env.DB.prepare('UPDATE tombstones SET profile = ? WHERE user_id = ? AND profile = ?')
+        .bind(target, user.id, from),
+      env.DB.prepare('INSERT OR IGNORE INTO profiles (user_id, name, added_at) VALUES (?,?,?)')
+        .bind(user.id, target, now()),
+      env.DB.prepare('DELETE FROM profiles WHERE user_id = ? AND name = ?')
+        .bind(user.id, from),
+      env.DB.prepare(
+        'UPDATE users SET default_profile = ? WHERE id = ? AND default_profile = ?'
+      ).bind(target, user.id, from)
+    ]);
+
+    return json(await loadState(env, user), env);
   }
 
   if (path === '/api/logout' && request.method === 'POST') {

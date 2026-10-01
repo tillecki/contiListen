@@ -148,9 +148,10 @@ back mid-sentence (**⋯ → Rewind on resume**).
 partner sharing one Spotify account don't overwrite each other. Separate Spotify
 accounts are separate logins and never mix.
 
-**🔈 chip** — choose the playback device, or pin one. Speakers are never picked
-automatically; an idle Echo stays "active" for hours, which is how audio ends up in
-the wrong room.
+**🔈 chip** — tap a device to move what's playing there now; tap its star to pin it
+for every future resume. Pinning is strict. On automatic, a phone or computer always
+wins — a speaker is only used after ~13 seconds of waiting, since an always-on Echo
+would otherwise beat a phone that's still launching.
 
 **★ next to Playing now** — follow what's playing: the artist, the album, the
 podcast, or the playlist it's playing from.
@@ -160,6 +161,15 @@ plain keywords.
 
 **⋯ on a row** — Continue, **Jump back to earlier**, switch whole-book vs this-part
 progress, mark finished, forget.
+
+**Swipe** left or right anywhere on the list to reach the device picker or the
+profile picker without scrolling back to the top.
+
+**Sleep timer** (⋯ → Sleep timer) pauses Spotify after 15–60 minutes. It runs on the
+server, so it works with the phone asleep and nothing open, and your position is
+recorded on the same pass just before playback stops.
+
+**Renaming a profile** (✎ in the 👤 menu) moves every bookmark with it.
 
 **Jump back to earlier** is the fell-asleep fix. Positions are saved as breadcrumbs
 while you listen, so if you doze off in chapter 12 and Spotify runs to chapter 40,
@@ -203,6 +213,17 @@ against Worker CPU time, so the resume loop is nearly free.
 | No percentage on a row | The chapter list is still loading, or Spotify won't return it. ⋯ → **Clear chapter cache** forces a retry. |
 | Audiobook shows only the current chapter | ⋯ on that row → **Measure progress across the whole book**. |
 | Shortcut does nothing | Check the link still matches; pressing **New key** invalidates the old one. |
+
+## Upgrading an existing install
+
+Schema changes ship as files in `worker/migrations/`. Run each once:
+
+```bash
+npx wrangler d1 execute contilisten --remote --file=./migrations/001-sleep-timer.sql
+```
+
+Then `npx wrangler deploy`. Fresh installs get everything from `schema.sql` and can
+skip this.
 
 To see what the Worker is doing: `npx wrangler tail` streams live logs, including
 every cron run.

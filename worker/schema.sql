@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS users (
   mode            TEXT DEFAULT 'everything',
   rewind_sec      INTEGER DEFAULT 15,
   pinned_device   TEXT,
+  sleep_until     INTEGER,                 -- epoch ms; cron pauses playback at this point
   created_at      INTEGER NOT NULL,
   last_seen       INTEGER NOT NULL
 );
