@@ -513,16 +513,26 @@ async function containerMap(env, user, uri) {
    you switch to Spotify, so it can never see the device appear. This can.
    ──────────────────────────────────────────────────────────── */
 
-const FAR = new Set(['Speaker','CastAudio','CastVideo','TV','AVR','STB','GameConsole','AudioDongle']);
+/* An allowlist, not a blocklist: Spotify reports Echos variously as Speaker,
+   CastAudio or Unknown, so anything not recognisably in your hand is treated as
+   "somewhere else in the house". */
+const NEAR = new Set(['Smartphone', 'Tablet', 'Computer', 'Automobile']);
 
-function rankDevice(d, pinnedId) {
-  if (pinnedId && d.id === pinnedId) return -1;
-  const far = FAR.has(d.type);
-  if (d.is_active && !far) return 0;
-  if (d.type === 'Smartphone' || d.type === 'Tablet') return 1;
-  if (d.type === 'Computer') return 2;
-  if (d.is_active) return 3;
-  return 4;
+/**
+ * A speaker is always online, so it would otherwise win every race against a
+ * phone that is still launching. While `eager` is set we refuse anything that
+ * isn't handheld and keep waiting; only near the end of the window do we accept
+ * whatever is left.
+ */
+function chooseDevice(devices, pinnedId, eager) {
+  // A pinned device is a decision, not a preference. Never substitute.
+  if (pinnedId) return devices.find(d => d.id === pinnedId) || null;
+
+  const byActive = (a, b) => (b.is_active ? 1 : 0) - (a.is_active ? 1 : 0);
+  const near = devices.filter(d => NEAR.has(d.type));
+  if (near.length) return [...near].sort(byActive)[0];
+
+  return eager ? null : [...devices].sort(byActive)[0] || null;
 }
 
 async function doResume(env, user, { profile, key }) {
@@ -545,6 +555,8 @@ async function doResume(env, user, { profile, key }) {
   const pinned = user.pinned_device ? JSON.parse(user.pinned_device)?.id : null;
 
   // Spotify takes a few seconds to register after launching. Wait it out.
+  const GRACE = RESUME_TRIES - 5;      // after this, settle for anything
+
   for (let attempt = 0; attempt < RESUME_TRIES; attempt++) {
     let devices = [];
     try {
@@ -552,8 +564,9 @@ async function doResume(env, user, { profile, key }) {
       devices = (d?.devices || []).filter(x => x.id);
     } catch (e) { /* transient; try again */ }
 
-    if (devices.length) {
-      const target = [...devices].sort((a, c) => rankDevice(a, pinned) - rankDevice(c, pinned))[0];
+    const target = chooseDevice(devices, pinned, attempt < GRACE);
+
+    if (target) {
 
       if (!target.is_active) {
         try {
@@ -589,7 +602,7 @@ async function doResume(env, user, { profile, key }) {
     await sleep(RESUME_GAP_MS);
   }
 
-  return { ok: false, reason: 'no_device' };
+  return { ok: false, reason: pinned ? 'pinned_offline' : 'no_device' };
 }
 
 /* ── Recording playback ────────────────────────────────────── */

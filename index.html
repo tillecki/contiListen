@@ -147,7 +147,7 @@
    The redirect URI is this page's own URL; register it verbatim
    in the Spotify dashboard.
    ════════════════════════════════════════════════════════════ */
-const WORKER = 'https://contilisten.tillmax.workers.dev';  // no trailing slash
+const WORKER = 'https://contilisten.tillmax.workers.dev';   // no trailing slash
 
 /* ── Crash guard ──────────────────────────────────────────────
    Anything thrown before render() used to leave a blank black page with no
@@ -704,32 +704,30 @@ const DEVICE_ICON = {
 };
 const deviceIcon = t => DEVICE_ICON[t] || '🎵';
 
-// Things in another room. Never auto-selected, even when Spotify calls them active —
-// an idle Echo stays "active" for hours after you stop using it.
-const FAR = new Set(['Speaker','CastAudio','CastVideo','TV','AVR','STB','GameConsole','AudioDongle']);
+// An allowlist, not a blocklist: Spotify reports Echos variously as Speaker,
+// CastAudio or Unknown, so anything not recognisably in your hand counts as
+// "somewhere else in the house" and is never auto-selected.
+const NEAR = new Set(['Smartphone', 'Tablet', 'Computer', 'Automobile']);
 
 const listDevices = async () =>
   ((await api('/v1/me/player/devices'))?.devices || []).filter(x => x.id);
 
-function rank(d) {
-  const far = FAR.has(d.type);
-  if (d.is_active && !far) return 0;
-  if (d.type === 'Smartphone' || d.type === 'Tablet') return 1;
-  if (d.type === 'Computer') return 2;
-  if (d.is_active) return 3;
-  return 4;
-}
-
 async function resolveDevice() {
   const list = await listDevices();
   const pinned = DB.get('pinnedDevice');
+
+  // A pin is a decision, not a preference — never substitute something else.
   if (pinned) {
     const hit = list.find(x => x.id === pinned.id);
     if (hit) return { device: hit };
     return { device: null, reason: 'offline', pinned };
   }
   if (!list.length) return { device: null, reason: 'empty' };
-  return { device: [...list].sort((a, b) => rank(a) - rank(b))[0] };
+
+  // Prefer anything handheld. A speaker only wins when nothing else is awake.
+  const byActive = (a, b) => (b.is_active ? 1 : 0) - (a.is_active ? 1 : 0);
+  const near = list.filter(d => NEAR.has(d.type));
+  return { device: [...(near.length ? near : list)].sort(byActive)[0] };
 }
 
 /** Resume through the Worker, which keeps polling for your device while Spotify
@@ -751,6 +749,10 @@ async function resumeViaWorker(b, label) {
       toast('Spotify Premium is required to control playback.', true);
     } else if (r?.reason === 'nothing_saved') {
       toast('Nothing saved for this profile yet.', true);
+    } else if (r?.reason === 'pinned_offline') {
+      const p = DB.get('pinnedDevice');
+      toast(`${p?.name || 'Your pinned device'} never came online. Open Spotify there, `
+        + 'or unpin it in the 🔈 menu.', true);
     } else {
       toast('Spotify never came online. Open it once, then try again.', true);
     }
@@ -1452,8 +1454,11 @@ function drawDevices(list) {
       <button class="ghost" onclick="openDevices()">Refresh</button>
       <button class="ghost" onclick="location.href='spotify:'">Open Spotify here</button>
     </div>
-    <p class="hint">Pinning a device makes every resume go there. If it's asleep the app
-       will offer to wake Spotify instead of quietly picking something in another room.</p>`;
+    <p class="hint">Pinning is strict — playback only ever goes there, and you're told
+       if it's asleep rather than audio quietly landing in another room.</p>
+    <p class="hint">On automatic, a phone or computer always wins. A speaker is only
+       used after about 13 seconds of waiting for something handheld, because an Echo
+       is always online and would otherwise beat a phone that's still launching.</p>`;
 }
 
 function pinDevice(id, name) {
