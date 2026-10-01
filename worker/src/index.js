@@ -35,9 +35,17 @@ function randomHex(bytes = 32) {
   return [...a].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** A CORS origin is scheme + host only. APP_ORIGIN is the full page URL because
+    the login redirect needs the path, so strip it down here rather than making
+    the two settings disagree. */
+function allowedOrigin(env) {
+  try { return new URL(env.APP_ORIGIN).origin; }
+  catch (e) { return env.APP_ORIGIN || '*'; }
+}
+
 function corsHeaders(env) {
   return {
-    'Access-Control-Allow-Origin': env.APP_ORIGIN || '*',
+    'Access-Control-Allow-Origin': allowedOrigin(env),
     'Access-Control-Allow-Headers': 'Authorization, Content-Type',
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
     'Access-Control-Max-Age': '86400',
@@ -700,9 +708,18 @@ async function pollAll(env) {
     'SELECT * FROM users WHERE last_seen > ?'
   ).bind(now() - 90 * 864e5).all();
 
-  for (const user of users.results || []) {
-    try { await recordNowPlaying(env, user); }
-    catch (e) { console.log('poll failed for', user.id, e.message); }
+  const list = users.results || [];
+  if (!list.length) { console.log('cron: no active users'); return; }
+
+  for (const user of list) {
+    try {
+      const r = await recordNowPlaying(env, user);
+      console.log(`cron ${user.id}:`, r.recorded
+        ? `saved "${r.album}" at ${Math.round(r.positionMs / 1000)}s`
+        : r.reason);
+    } catch (e) {
+      console.log('cron failed for', user.id, e.message);
+    }
   }
 }
 

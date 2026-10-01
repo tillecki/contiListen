@@ -147,7 +147,7 @@
    The redirect URI is this page's own URL; register it verbatim
    in the Spotify dashboard.
    ════════════════════════════════════════════════════════════ */
-const WORKER = 'https://contilisten.tillmax.workers.dev';   // no trailing slash
+const WORKER = 'https://contilisten.tillmax.workers.dev';  // no trailing slash
 
 /* ── Crash guard ──────────────────────────────────────────────
    Anything thrown before render() used to leave a blank black page with no
@@ -675,6 +675,7 @@ async function sync(manual) {
   } catch (e) {
     if (e.message === 'NOT_SIGNED_IN') { state.signedIn = false; render(); }
     else if (manual) toast('Sync failed: ' + e.message, true);
+    else reportReachability(e);
   } finally {
     syncing = false;
     if (manual) render();
@@ -868,8 +869,21 @@ async function poll() {
     if (after && after.positionMs !== beforePos) pushBookmark(after);
 
   } catch (e) {
-    if (e.message === 'NOT_SIGNED_IN') { state.signedIn = false; render(true); }
+    if (e.message === 'NOT_SIGNED_IN') { state.signedIn = false; render(true); return; }
+    // A blocked or unreachable Worker used to fail silently here, which made it
+    // look like nothing was being recorded for no reason. Say so, once.
+    reportReachability(e);
   }
+}
+
+let warnedUnreachable = false;
+function reportReachability(e) {
+  if (warnedUnreachable) return;
+  warnedUnreachable = true;
+  const blocked = e instanceof TypeError || /fetch|network|load failed/i.test(e.message || '');
+  toast(blocked
+    ? "Can't reach your server. Check APP_ORIGIN matches this site, then redeploy."
+    : (e.message || 'Server error'), true);
 }
 
 /* ── Polling lifecycle ────────────────────────────────────── */
