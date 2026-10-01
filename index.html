@@ -162,7 +162,7 @@ function showFatal(err) {
       '<div style="font-size:44px">⚠️</div>' +
       '<h3 style="margin:14px 0 8px;font-size:19px">ContiListen hit an error</h3>' +
       '<p style="color:#8b9a92;font-size:13.5px;margin:0 0 18px">' +
-        'Your bookmarks are safe in the gist if sync is on.</p>' +
+        'Your bookmarks are safe on the server.</p>' +
       '<pre style="text-align:left;background:#131a17;border:1px solid #243029;' +
         'border-radius:10px;padding:12px;font-size:11px;overflow-x:auto;' +
         'white-space:pre-wrap;color:#f2d98d">' +
@@ -811,6 +811,66 @@ const byId = id => state.bookmarks.find(b => b.id === id);
 const resumeById = id => { const b = byId(id); if (b) resume(b); };
 
 const playAlbum = (uri, name) => startPlayback({ context_uri: uri, position_ms: 0 }, name);
+
+/* ── Player ───────────────────────────────────────────────── */
+
+/** Normalises a track, a podcast episode or an audiobook chapter into one shape.
+    Each carries a different parent field: album, show, audiobook. */
+function describeItem(d) {
+  const it = d.item;
+  const parent = it.album || it.show || it.audiobook || null;
+  const imgs = it.images || parent?.images || [];
+  const people = it.artists || it.authors || [];
+  const kind = it.type === 'chapter' ? 'chapter'
+             : it.type === 'episode' ? (it.audiobook ? 'chapter' : 'episode')
+             : 'track';
+
+  return {
+    trackURI: it.uri,
+    trackName: it.name,
+    trackNumber: it.track_number ?? it.chapter_number ?? null,
+    durationMs: it.duration_ms || 0,
+    positionMs: d.progress_ms || 0,
+    isPlaying: !!d.is_playing,
+    contextURI: d.context?.uri || null,
+    albumURI: parent?.uri || null,
+    albumName: parent?.name || it.name,
+    artistName: people[0]?.name || parent?.publisher || '',
+    artistURI: people[0]?.uri || null,
+    art: (imgs.length > 1 ? imgs[1] : imgs[0])?.url || null,
+    kind
+  };
+}
+
+/** Reads the live position while the app is on screen. The Worker does the same
+    once a minute regardless, so this is the fine-grained layer, not the only one. */
+async function poll() {
+  if (!state.signedIn) return;
+  try {
+    const d = await api('/v1/me/player?additional_types=episode');
+    if (!d || !d.item) { state.nowPlaying = null; return render(); }
+
+    state.nowPlaying = describeItem(d);
+    const before = state.bookmarks.find(b => b.id === state.profile + '::' +
+      (state.nowPlaying.kind === 'episode'
+        ? state.nowPlaying.trackURI
+        : (state.nowPlaying.contextURI || state.nowPlaying.albumURI || state.nowPlaying.trackURI)));
+    const beforePos = before?.positionMs;
+
+    record(state.nowPlaying);
+    render();
+    warmAlbums();
+
+    // Push straight away when the position actually moved, so closing the tab
+    // can't lose it.
+    const after = state.bookmarks.find(b => b.profile === state.profile
+      && b.trackURI === state.nowPlaying.trackURI);
+    if (after && after.positionMs !== beforePos) pushBookmark(after);
+
+  } catch (e) {
+    if (e.message === 'NOT_SIGNED_IN') { state.signedIn = false; render(true); }
+  }
+}
 
 /* ── Polling lifecycle ────────────────────────────────────── */
 let pollTimer = null;
