@@ -21,6 +21,9 @@ const SCOPES = [
   'user-read-private'
 ].join(' ');
 
+// Bumped on every deploy, so /health proves which build is actually live.
+const BUILD = 'worker-2026-10-25.1';
+
 const SESSION_DAYS = 180;
 const RESUME_TRIES = 18;        // ~18s of waiting for Spotify to register
 const RESUME_GAP_MS = 1000;
@@ -316,6 +319,11 @@ async function loadState(env, user) {
     env.DB.prepare('SELECT * FROM tombstones WHERE user_id = ?').bind(user.id).all()
   ]);
 
+  const series = await env.DB.prepare('SELECT uri, mode FROM series_mode WHERE user_id = ?')
+    .bind(user.id).all();
+  const seriesMode = {};
+  for (const r of series.results || []) seriesMode[r.uri] = r.mode;
+
   const tombstones = {};
   for (const t of tombs.results || []) {
     tombstones[t.profile + '::' + t.key] = new Date(t.deleted_at).toISOString();
@@ -335,6 +343,7 @@ async function loadState(env, user) {
       pinnedDevice: user.pinned_device ? JSON.parse(user.pinned_device) : null,
       sleepUntil: user.sleep_until || null
     },
+    seriesMode,
     profiles: (profiles.results || []).map(p => p.name),
     bookmarks: (bookmarks.results || []).map(rowToBookmark),
     watchlist: (watch.results || []).map(w => ({
@@ -349,6 +358,123 @@ const ts = v => {
   const n = typeof v === 'number' ? v : Date.parse(v || 0);
   return Number.isFinite(n) ? n : 0;
 };
+
+/**
+ * Which bookmark a now-playing item belongs to.
+ *
+ * Two traps here, both found in real data:
+ *   - A playlist or Liked-Songs context is NOT the work. Keying on it made every
+ *     Hörspiel played from one playlist collapse into a single row that each
+ *     overwrote in turn, so albumURI is preferred over contextURI.
+ *   - Spotify serves some audiobooks as shows, indistinguishable from podcasts.
+ *     `bookSeries` carries the listener's decision for that show.
+ */
+function bookmarkKey(np, bookSeries) {
+  const parent = np.albumURI || null;
+  if (np.kind === 'episode') {
+    return (parent && bookSeries) ? parent : np.trackURI;
+  }
+  // A context that isn't the work itself (playlist, collection) is useless as an
+  // identity, so only fall back to it when there is no parent at all.
+  const usableContext = /^spotify:(album|audiobook|show):/.test(np.contextURI || '')
+    ? np.contextURI : null;
+  return parent || usableContext || np.trackURI;
+}
+
+/**
+ * Which show or book an episode belongs to, when Spotify didn't say.
+ *
+ * Skipping backwards makes /v1/me/player briefly return an episode with no
+ * `show` object and sometimes no context. A single poll in that window used to
+ * mint a fresh bookmark keyed on the episode, fragmenting a book that was
+ * already merged. Two cheap sources recover it:
+ *   1. the chapter list we already cached for this show
+ *   2. Spotify itself, asked once and remembered
+ */
+async function resolveParent(env, user, np) {
+  if (np.albumURI) return np.albumURI;
+  if (np.kind !== 'episode' && np.kind !== 'chapter') return null;
+
+  const known = await env.DB.prepare(
+    'SELECT uri FROM containers WHERE parts LIKE ? LIMIT 1'
+  ).bind('%"' + np.trackURI + '"%').first();
+  if (known?.uri) return known.uri;
+
+  // Ask Spotify, then cache the answer in containers' stead via titles so the
+  // next orphaned poll is free.
+  const id = (np.trackURI || '').split(':').pop();
+  if (!id) return null;
+  const cachedName = await env.DB.prepare(
+    'SELECT name FROM titles WHERE uri = ?'
+  ).bind('parent:' + np.trackURI).first();
+  if (cachedName?.name) return cachedName.name;
+
+  try {
+    const mk = user.market ? '?market=' + user.market : '';
+    const ep = await spotifyJSON(env, user, `/v1/episodes/${id}${mk}`);
+    const parent = ep?.show?.uri || ep?.audiobook?.uri || null;
+    if (parent) {
+      await env.DB.prepare(
+        `INSERT INTO titles (uri, name, fetched_at) VALUES (?,?,?)
+         ON CONFLICT(uri) DO UPDATE SET name = excluded.name`
+      ).bind('parent:' + np.trackURI, parent, now()).run();
+      return parent;
+    }
+  } catch (e) { /* offline or unavailable; fall through */ }
+  return null;
+}
+
+/** Has the listener marked this show as a single book? */
+async function isBookSeries(env, userId, uri) {
+  if (!uri) return false;
+  if (uri.startsWith('spotify:audiobook:')) return true;      // unambiguous
+  const row = await env.DB.prepare(
+    'SELECT mode FROM series_mode WHERE user_id = ? AND uri = ?'
+  ).bind(userId, uri).first();
+  return row?.mode === 'book';
+}
+
+/**
+ * Forces an incoming bookmark onto the right key before it is stored.
+ *
+ * The server used to trust whatever key a device sent, so a phone running a
+ * stale build — or one that had not yet pulled `series_mode` — could re-split a
+ * book into one row per chapter however many times you merged it. The series
+ * marking lives here, so the decision belongs here too.
+ */
+async function normaliseBookmark(env, userId, b) {
+  const parent = b.albumURI || null;
+  const strayKey = b.key || b.id;
+
+  // Logged for every episode-shaped row, so `wrangler tail` shows exactly what a
+  // device sent and why it was or wasn't re-keyed.
+  const trace = (verdict) => {
+    if (b.kind === 'track') return;
+    console.log(`sync in: key=${strayKey} album=${parent} kind=${b.kind} -> ${verdict}`);
+  };
+
+  if (!parent || b.kind === 'track') { trace('left alone (no parent)'); return b; }
+  if (!(await isBookSeries(env, userId, parent))) {
+    trace('left alone (series not marked as book)');
+    return b;
+  }
+  if (strayKey === parent) { trace('already correct'); return b; }
+  trace('RE-KEYED onto ' + parent);
+
+  // Retire the per-chapter row this device believed in.
+  if (strayKey) {
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM bookmarks WHERE user_id = ? AND profile = ? AND "key" = ?')
+        .bind(userId, b.profile || 'Me', strayKey),
+      env.DB.prepare(
+        `INSERT INTO tombstones (user_id, profile, "key", deleted_at) VALUES (?,?,?,?)
+         ON CONFLICT(user_id, profile, "key") DO UPDATE SET deleted_at = excluded.deleted_at`
+      ).bind(userId, b.profile || 'Me', strayKey, now())
+    ]);
+  }
+
+  return { ...b, key: parent, id: undefined, kind: 'chapter', wholeSeries: true };
+}
 
 /** Newest-wins per row, so concurrent devices merge instead of overwrite. */
 async function upsertBookmark(env, userId, b) {
@@ -430,8 +556,9 @@ async function applySync(env, user, payload) {
   }
   if (stmts.length) await env.DB.batch(stmts);
 
-  for (const b of payload.bookmarks || []) {
-    if (b && (b.key || b.id)) await upsertBookmark(env, user.id, b);
+  for (const raw of payload.bookmarks || []) {
+    if (!raw || !(raw.key || raw.id)) continue;
+    await upsertBookmark(env, user.id, await normaliseBookmark(env, user.id, raw));
   }
 
   // A tombstone always outranks a row that is no newer than it.
@@ -514,6 +641,39 @@ async function containerMap(env, user, uri) {
   return { totalMs: total, count, tracks };
 }
 
+/** The display name of an audiobook, show or album. Spotify sometimes hands back
+    a chapter with no parent object, leaving the chapter title where the book title
+    belongs — so resolve it once and remember it. */
+async function parentTitle(env, user, uri) {
+  if (!uri) return null;
+  const [, kind, id] = uri.split(':');
+  if (!['audiobook', 'show', 'album'].includes(kind)) return null;
+
+  const cached = await env.DB.prepare('SELECT * FROM titles WHERE uri = ?').bind(uri).first();
+  if (cached) return { name: cached.name, art: cached.art, author: cached.author };
+
+  const mk = user.market ? '?market=' + user.market : '';
+  let obj = null;
+  try { obj = await spotifyJSON(env, user, `/v1/${kind}s/${id}${mk}`); }
+  catch (e) { return null; }
+  if (!obj?.name) return null;
+
+  const imgs = obj.images || [];
+  const found = {
+    name: obj.name,
+    art: (imgs.length > 1 ? imgs[1] : imgs[0])?.url || null,
+    author: obj.authors?.[0]?.name || obj.publisher || obj.artists?.[0]?.name || null
+  };
+
+  await env.DB.prepare(
+    `INSERT INTO titles (uri, name, art, author, fetched_at) VALUES (?,?,?,?,?)
+     ON CONFLICT(uri) DO UPDATE SET name=excluded.name, art=excluded.art,
+       author=excluded.author, fetched_at=excluded.fetched_at`
+  ).bind(uri, found.name, found.art, found.author, now()).run();
+
+  return found;
+}
+
 /* ── Resume ────────────────────────────────────────────────────
    The whole point of having a server. A web page gets suspended the instant
    you switch to Spotify, so it can never see the device appear. This can.
@@ -530,18 +690,36 @@ const NEAR = new Set(['Smartphone', 'Tablet', 'Computer', 'Automobile']);
  * isn't handheld and keep waiting; only near the end of the window do we accept
  * whatever is left.
  */
-function chooseDevice(devices, pinnedId, eager) {
-  // A pinned device is a decision, not a preference. Never substitute.
-  if (pinnedId) return devices.find(d => d.id === pinnedId) || null;
-
+function chooseDevice(devices, pinnedId, eager, hint) {
   const byActive = (a, b) => (b.is_active ? 1 : 0) - (a.is_active ? 1 : 0);
+
+  if (pinnedId) {
+    const exact = devices.find(d => d.id === pinnedId);
+    if (exact) return exact;
+    // Spotify mints a new device id on reinstall, so a remembered one can go
+    // stale. Once the eager window closes, recover by device type instead of
+    // failing outright.
+    if (!eager && hint) {
+      const sameKind = devices.filter(d => d.type === hint);
+      if (sameKind.length) return [...sameKind].sort(byActive)[0];
+    }
+    return null;
+  }
+
+  // The caller tells us what it's running on, so a request from the phone goes
+  // to the phone even when a laptop is also awake.
+  if (hint) {
+    const sameKind = devices.filter(d => d.type === hint);
+    if (sameKind.length) return [...sameKind].sort(byActive)[0];
+  }
+
   const near = devices.filter(d => NEAR.has(d.type));
   if (near.length) return [...near].sort(byActive)[0];
 
   return eager ? null : [...devices].sort(byActive)[0] || null;
 }
 
-async function doResume(env, user, { profile, key, device }) {
+async function doResume(env, user, { profile, key, device, hint }) {
   const wanted = profile || user.default_profile || 'Me';
 
   const row = key
@@ -572,7 +750,7 @@ async function doResume(env, user, { profile, key, device }) {
       devices = (d?.devices || []).filter(x => x.id);
     } catch (e) { /* transient; try again */ }
 
-    const target = chooseDevice(devices, pinned, attempt < GRACE);
+    const target = chooseDevice(devices, pinned, attempt < GRACE, hint);
 
     if (target) {
 
@@ -618,8 +796,11 @@ async function doResume(env, user, { profile, key, device }) {
           }
         } catch (e) { /* best effort; playback already started somewhere */ }
 
-        return { ok: true, device: target.name, album: b.albumName,
-                 positionMs: position, waitedMs: attempt * RESUME_GAP_MS };
+        // Hand the resolved id back so the caller can remember it, and refresh
+        // its copy when the id has changed underneath us.
+        return { ok: true, device: target.name, deviceId: target.id,
+                 album: b.albumName, positionMs: position,
+                 waitedMs: attempt * RESUME_GAP_MS };
       }
       if (res.status === 403) return { ok: false, reason: 'premium_required' };
     }
@@ -631,15 +812,35 @@ async function doResume(env, user, { profile, key, device }) {
 
 /* ── Recording playback ────────────────────────────────────── */
 
+/**
+ * Normalises a track, a podcast episode or an audiobook chapter into one shape.
+ *
+ * Audiobook chapters are the awkward case: they carry `spotify:episode:` URIs and
+ * `"type": "episode"`, so they are indistinguishable from podcast episodes unless
+ * either the item has an `audiobook` field or the playback context says
+ * `spotify:audiobook:`. Missing that made every chapter its own bookmark instead
+ * of one bookmark for the book.
+ */
 function describeItem(d) {
   const it = d.item;
   if (!it) return null;
-  const parent = it.album || it.show || it.audiobook || null;
+
+  const contextURI = d.context?.uri || null;
+  const contextKind = (contextURI || '').split(':')[1] || null;
+  const isAudiobook = !!it.audiobook || contextKind === 'audiobook';
+
+  const parent = it.album || it.audiobook || it.show || null;
   const imgs = it.images || parent?.images || [];
-  const people = it.artists || it.authors || [];
-  const kind = it.type === 'chapter' ? 'chapter'
-             : it.type === 'episode' ? (it.audiobook ? 'chapter' : 'episode')
+  const people = it.artists || it.authors || parent?.authors || [];
+
+  const kind = it.type === 'chapter' || isAudiobook ? 'chapter'
+             : it.type === 'episode' ? 'episode'
              : 'track';
+
+  // Without a parent object, the context is the only handle on the whole work.
+  const groupURI = parent?.uri
+    || (contextKind === 'audiobook' || contextKind === 'show' || contextKind === 'album'
+        ? contextURI : null);
 
   return {
     trackURI: it.uri,
@@ -648,8 +849,8 @@ function describeItem(d) {
     durationMs: it.duration_ms || 0,
     positionMs: d.progress_ms || 0,
     isPlaying: !!d.is_playing,
-    contextURI: d.context?.uri || null,
-    albumURI: parent?.uri || null,
+    contextURI,
+    albumURI: groupURI,
     albumName: parent?.name || it.name,
     artistName: people[0]?.name || parent?.publisher || '',
     artistURI: people[0]?.uri || null,
@@ -688,14 +889,19 @@ function pushHistory(history, entry) {
 async function recordNowPlaying(env, user) {
   let data;
   try {
-    data = await spotifyJSON(env, user, '/v1/me/player?additional_types=episode');
+    data = await spotifyJSON(env, user, '/v1/me/player?additional_types=track,episode');
   } catch (e) {
     return { recorded: false, reason: 'spotify_error' };
   }
   if (!data) return { recorded: false, reason: 'idle' };
 
   const np = describeItem(data);
-  if (!np) return { recorded: false, reason: 'idle' };
+  if (!np) {
+    // Spotify withholds `item` for some content. Say which kind, so this is
+    // diagnosable from the logs instead of looking like silence.
+    return { recorded: false,
+             reason: `no_item (playing type: ${data.currently_playing_type || 'unknown'})` };
+  }
 
   if ((user.mode || 'everything') === 'watchlist') {
     const wl = await env.DB.prepare('SELECT * FROM watchlist WHERE user_id = ?')
@@ -704,10 +910,21 @@ async function recordNowPlaying(env, user) {
     if (!watchMatches(np, list)) return { recorded: false, reason: 'not_watched' };
   }
 
+  // No parent object means albumName fell back to the chapter title. Fix it up.
+  if (np.albumURI && np.albumName === np.trackName) {
+    const parent = await parentTitle(env, user, np.albumURI);
+    if (parent) {
+      np.albumName = parent.name;
+      np.art = np.art || parent.art;
+      np.artistName = np.artistName || parent.author || '';
+    }
+  }
+
   const profile = user.default_profile || 'Me';
-  const key = np.kind === 'episode'
-    ? np.trackURI
-    : (np.contextURI || np.albumURI || np.trackURI);
+  // Recover the parent before keying, or a transient gap starts a new bookmark.
+  np.albumURI = await resolveParent(env, user, np) || np.albumURI;
+  const bookSeries = await isBookSeries(env, user.id, np.albumURI);
+  const key = bookmarkKey(np, bookSeries);
 
   const existing = await env.DB.prepare(
     'SELECT * FROM bookmarks WHERE user_id = ? AND profile = ? AND key = ?'
@@ -781,7 +998,9 @@ async function router(request, env, ctx) {
   if (path === '/auth/login') return handleLogin(env, url);
   if (path === '/auth/callback') return handleCallback(env, url);
 
-  if (path === '/health') return json({ ok: true, time: new Date().toISOString() }, env);
+  if (path === '/health') {
+    return json({ ok: true, build: BUILD, time: new Date().toISOString() }, env);
+  }
 
   /* Shortcut / Siri entry point. A bare GET so Shortcuts can just fetch a URL,
      authenticated by a long random key rather than a session. */
@@ -794,9 +1013,10 @@ async function router(request, env, ctx) {
     // Lets a lock-screen Shortcut target an always-on speaker, which needs no
     // unlocking because nothing has to be launched.
     const device = url.searchParams.get('device') || undefined;
+    const hint = url.searchParams.get('hint') || undefined;
 
     // Answer instantly so Siri isn't left hanging; keep working in the background.
-    ctx.waitUntil(doResume(env, user, { profile, key, device }));
+    ctx.waitUntil(doResume(env, user, { profile, key, device, hint }));
     return json({ ok: true, queued: true, message: 'Resuming…' }, env);
   }
 
@@ -817,6 +1037,8 @@ async function router(request, env, ctx) {
 
   if (path === '/api/sync' && request.method === 'POST') {
     const payload = await request.json().catch(() => ({}));
+    console.log(`/api/sync from ${user.id} [${request.headers.get('X-App-Build') || 'build unknown'}]`
+      + `: ${(payload.bookmarks || []).length} bookmarks`);
     await applySync(env, user, payload);
     return json(await loadState(env, user), env);
   }
@@ -824,8 +1046,22 @@ async function router(request, env, ctx) {
   if (path === '/api/bookmark' && request.method === 'POST') {
     const b = await request.json().catch(() => null);
     if (!b) return fail(env, 400, 'bad body');
-    await upsertBookmark(env, user.id, b);
+    console.log(`/api/bookmark from ${user.id}: key=${b.key || b.id}`);
+    await upsertBookmark(env, user.id, await normaliseBookmark(env, user.id, b));
     return json({ ok: true }, env);
+  }
+
+  if (path === '/api/parent' && request.method === 'GET') {
+    const track = url.searchParams.get('track');
+    if (!track) return fail(env, 400, 'track required');
+    const uri = await resolveParent(env, user, { trackURI: track, kind: 'episode' });
+    return json({ uri: uri || null }, env);
+  }
+
+  if (path === '/api/title' && request.method === 'GET') {
+    const uri = url.searchParams.get('uri');
+    if (!uri) return fail(env, 400, 'uri required');
+    return json(await parentTitle(env, user, uri) || { failed: true }, env);
   }
 
   if (path === '/api/container' && request.method === 'GET') {
@@ -863,6 +1099,88 @@ async function router(request, env, ctx) {
       return json({ ok: false, status: res.status }, env);
     }
     return json({ ok: true }, env);
+  }
+
+  if (path === '/api/debug/player' && request.method === 'GET') {
+    let raw = null, error = null;
+    try { raw = await spotifyJSON(env, user, '/v1/me/player?additional_types=track,episode'); }
+    catch (e) { error = e.message; }
+
+    const it = raw?.item;
+    return json({
+      error,
+      empty: !raw,
+      currentlyPlayingType: raw?.currently_playing_type || null,
+      hasItem: !!it,
+      itemType: it?.type || null,
+      itemUri: it?.uri || null,
+      itemName: it?.name || null,
+      contextUri: raw?.context?.uri || null,
+      contextType: raw?.context?.type || null,
+      parentFields: it ? {
+        album: it.album?.uri || null,
+        show: it.show?.uri || null,
+        audiobook: it.audiobook?.uri || null
+      } : null,
+      chapterNumber: it?.chapter_number ?? null,
+      trackNumber: it?.track_number ?? null,
+      durationMs: it?.duration_ms ?? null,
+      progressMs: raw?.progress_ms ?? null,
+      interpreted: it ? describeItem(raw) : null
+    }, env);
+  }
+
+  /* Marking a show as a book also merges the per-episode rows it already made:
+     the furthest-along one becomes the book's bookmark, the rest are tombstoned
+     so other devices don't push them back. */
+  if (path === '/api/series-mode' && request.method === 'POST') {
+    const { uri, mode } = await request.json().catch(() => ({}));
+    if (!uri || !['book', 'episodes'].includes(mode)) {
+      return fail(env, 400, 'uri and mode (book|episodes) required');
+    }
+
+    await env.DB.prepare(
+      `INSERT INTO series_mode (user_id, uri, mode, set_at) VALUES (?,?,?,?)
+       ON CONFLICT(user_id, uri) DO UPDATE SET mode=excluded.mode, set_at=excluded.set_at`
+    ).bind(user.id, uri, mode, now()).run();
+
+    let merged = 0;
+    if (mode === 'book') {
+      const strays = await env.DB.prepare(
+        `SELECT * FROM bookmarks
+         WHERE user_id = ? AND album_uri = ? AND "key" <> ?
+         ORDER BY updated_at DESC`
+      ).bind(user.id, uri, uri).all();
+
+      const rows = strays.results || [];
+      if (rows.length) {
+        // Most recently touched wins; it is the furthest you actually got.
+        const keep = rows[0];
+        await upsertBookmark(env, user.id, {
+          ...rowToBookmark(keep),
+          key: uri,
+          kind: 'chapter',
+          wholeSeries: true,
+          updatedAt: new Date(keep.updated_at).toISOString()
+        });
+
+        const stmts = [];
+        for (const r of rows) {
+          stmts.push(env.DB.prepare(
+            'DELETE FROM bookmarks WHERE user_id = ? AND profile = ? AND "key" = ?'
+          ).bind(user.id, r.profile, r.key));
+          stmts.push(env.DB.prepare(
+            `INSERT INTO tombstones (user_id, profile, "key", deleted_at) VALUES (?,?,?,?)
+             ON CONFLICT(user_id, profile, "key") DO UPDATE SET deleted_at=excluded.deleted_at`
+          ).bind(user.id, r.profile, r.key, now()));
+        }
+        await env.DB.batch(stmts);
+        merged = rows.length;
+      }
+    }
+
+    const state = await loadState(env, user);
+    return json({ ...state, merged }, env);
   }
 
   if (path === '/api/sleep' && request.method === 'POST') {
