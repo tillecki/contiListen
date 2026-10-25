@@ -160,7 +160,9 @@ podcast, or the playlist it's playing from.
 plain keywords.
 
 **⋯ on a row** — Continue, **Jump back to earlier**, switch whole-book vs this-part
-progress, mark finished, forget.
+progress, mark finished, forget. On anything Spotify delivers as a show, also
+**Treat this series as one book** — which is how you tell an audiobook apart from a
+podcast, since the API doesn't.
 
 **Swipe** left or right anywhere on the list to reach the device picker or the
 profile picker without scrolling back to the top.
@@ -212,6 +214,8 @@ against Worker CPU time, so the resume loop is nearly free.
 | Playback goes to the wrong speaker | Pin the right device via the 🔈 chip. |
 | No percentage on a row | The chapter list is still loading, or Spotify won't return it. ⋯ → **Clear chapter cache** forces a retry. |
 | Audiobook shows only the current chapter | ⋯ on that row → **Measure progress across the whole book**. |
+| Each audiobook chapter is its own row | Spotify serves some audiobooks as podcasts, with no field saying which. Open ⋯ on any of those rows → **Treat this series as one book**. It merges the existing rows and keeps your furthest position. |
+| Several different Hörspiele share one row | They were played from a playlist, and old rows keyed on the playlist instead of the album. Run the repair under *Upgrading an existing install*. |
 | Shortcut does nothing | Check the link still matches; pressing **New key** invalidates the old one. |
 
 ## Upgrading an existing install
@@ -220,6 +224,19 @@ Schema changes ship as files in `worker/migrations/`. Run each once:
 
 ```bash
 npx wrangler d1 execute contilisten --remote --file=./migrations/001-sleep-timer.sql
+npx wrangler d1 execute contilisten --remote --file=./migrations/002-title-cache.sql
+npx wrangler d1 execute contilisten --remote --file=./migrations/003-series-mode.sql
+```
+
+### Repairing bookmarks from before the keying fix
+
+Rows recorded before that fix may be keyed to a playlist rather than the work, so
+several Hörspiele shared one row. `worker/maintenance/` has an inspect script and a
+repair that re-keys them while keeping their positions:
+
+```bash
+npx wrangler d1 execute contilisten --remote --file=./maintenance/inspect-miskeyed.sql
+npx wrangler d1 execute contilisten --remote --file=./maintenance/repair-miskeyed.sql
 ```
 
 Then `npx wrangler deploy`. Fresh installs get everything from `schema.sql` and can
@@ -227,3 +244,14 @@ skip this.
 
 To see what the Worker is doing: `npx wrangler tail` streams live logs, including
 every cron run.
+
+To see exactly what Spotify reports for whatever is playing right now, open this
+while signed in:
+
+```
+https://your-worker.workers.dev/api/debug/player
+```
+
+It needs a session, so open it from the same browser you use the app in. It shows
+the raw item type, the context URI, which parent fields are present, and how
+ContiListen interpreted them — which is how the audiobook grouping bug was found.

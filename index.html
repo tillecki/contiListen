@@ -147,7 +147,12 @@
    The redirect URI is this page's own URL; register it verbatim
    in the Spotify dashboard.
    ════════════════════════════════════════════════════════════ */
-const WORKER = 'https://contilisten.tillmax.workers.dev';   // no trailing slash
+const WORKER = 'https://contilisten.YOURNAME.workers.dev';   // no trailing slash
+
+// Shown in Settings. iOS caches Home Screen web apps aggressively, so this is
+// how you tell at a glance whether the page you are looking at is the one you
+// last published.
+const BUILD = 'app-2026-10-25.2';
 
 /* ── Crash guard ──────────────────────────────────────────────
    Anything thrown before render() used to leave a blank black page with no
@@ -180,6 +185,17 @@ window.addEventListener('error', e => showFatal(e.error || e.message));
 window.addEventListener('unhandledrejection', e => showFatal(e.reason));
 
 /** Escape hatch: wipe everything local, drop the service worker, start clean. */
+/** Drops the service worker and caches, keeping your session, then reloads. */
+async function hardReload() {
+  try {
+    if ('caches' in window) for (const k of await caches.keys()) await caches.delete(k);
+    if ('serviceWorker' in navigator) {
+      for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+    }
+  } catch (e) {}
+  location.replace(location.origin + location.pathname + '?v=' + Date.now());
+}
+
 async function resetLocalData() {
   try { localStorage.clear(); } catch (e) {}
   try {
@@ -349,6 +365,9 @@ async function worker(path, method = 'GET', body) {
     method,
     headers: {
       Authorization: 'Bearer ' + token,
+      // Lets `wrangler tail` show which build each device is running, instead of
+      // relying on someone reading it off a settings screen.
+      'X-App-Build': BUILD,
       ...(body ? { 'Content-Type': 'application/json' } : {})
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -420,13 +439,69 @@ function pushHistory(history, entry) {
   return list.slice(-HISTORY_CAP);
 }
 
+/** Has this show been marked as a single book? Audiobook URIs are unambiguous;
+    shows need the listener's word, because Spotify gives no signal. */
+const isBookSeries = uri => !!uri && (uri.startsWith('spotify:audiobook:')
+  || DB.get('seriesMode', {})[uri] === 'book');
+
+/** A row recorded for a book-marked series should measure across the whole work
+    even before this device has pulled the mark. */
+const looksLikeBookRow = b => b.key === b.albumURI && b.kind !== 'track';
+
+/**
+ * Which bookmark an item belongs to. Two traps, both seen in real data:
+ *  - a playlist or Liked-Songs context is not the work, so keying on it made
+ *    every Hörspiel in one playlist collapse into a single overwritten row;
+ *  - Spotify serves some audiobooks as shows, identical to podcasts.
+ */
+function bookmarkKey(np) {
+  const parent = np.albumURI || null;
+  if (np.kind === 'episode') {
+    if (!parent) return np.trackURI;
+    // The mark itself, once this device has pulled it.
+    if (isBookSeries(parent)) return parent;
+    // Otherwise take the hint from what is already saved: a bookmark keyed on
+    // the show *is* the server's decision, so follow it rather than inventing a
+    // second row that the next sync will delete. Without this the list shows a
+    // stray entry for a second and then reflows.
+    if (state.bookmarks.some(b => b.key === parent && (b.profile || 'Me') === state.profile)) {
+      return parent;
+    }
+    return np.trackURI;
+  }
+  const usableContext = /^spotify:(album|audiobook|show):/.test(np.contextURI || '')
+    ? np.contextURI : null;
+  return parent || usableContext || np.trackURI;
+}
+
+/** Which show an orphaned episode belongs to, from the chapter lists already
+    cached on this device. Spotify drops the `show` object for a poll or two
+    while you skip, and without this that gap starts a brand-new bookmark. */
+function parentFromCache(trackURI) {
+  const albums = DB.get('albums', {});
+  for (const [uri, meta] of Object.entries(albums)) {
+    if (meta && meta.tracks && meta.tracks[trackURI]) return uri;
+  }
+  return null;
+}
+
 function record(np) {
   if (state.mode === 'watchlist' && !watchMatches(np)) return;
-  // A podcast episode stands alone. An audiobook or Hörspiel is one bookmark for
-  // the whole thing, so its many chapters collapse into a single row.
-  const key = np.kind === 'episode'
-    ? np.trackURI
-    : (np.contextURI || np.albumURI || np.trackURI);
+
+  if (!np.albumURI && (np.kind === 'episode' || np.kind === 'chapter')) {
+    const found = parentFromCache(np.trackURI);
+    if (found) {
+      np.albumURI = found;
+    } else {
+      // Rather than guess and fragment a book, sit this poll out. The next one
+      // usually has the parent back, and the server's own poll has a deeper
+      // lookup. At worst this costs five seconds of position.
+      askParent(np.trackURI);
+      return;
+    }
+  }
+
+  const key = bookmarkKey(np);
   const id = state.profile + '::' + key;
   const tomb = DB.get('tombstones', {});
 
@@ -456,8 +531,43 @@ function record(np) {
   save();
 }
 
-/** Only the current profile's bookmarks. */
-const mine = () => state.bookmarks.filter(b => (b.profile || 'Me') === state.profile);
+/**
+ * The current profile's bookmarks, with same-work duplicates hidden.
+ *
+ * A row keyed on the whole work (key === albumURI) and a row keyed on one of its
+ * chapters are the same book. The server deletes the chapter row on its next
+ * write, but until that round trip lands the list would show both and then
+ * reflow — the flicker. Two rows for one work is never right, so never show it.
+ *
+ * Podcasts are untouched: their episodes share an albumURI but none of them is a
+ * whole-work row, so every episode keeps its place.
+ */
+function mine() {
+  const rows = state.bookmarks.filter(b => (b.profile || 'Me') === state.profile);
+
+  const wholeWork = new Set();
+  for (const b of rows) if (b.key && b.key === b.albumURI) wholeWork.add(b.albumURI);
+  if (!wholeWork.size) return rows;
+
+  return rows.filter(b => b.key === b.albumURI || !wholeWork.has(b.albumURI));
+}
+
+/** Ask the server which show an episode belongs to, and remember it so the next
+    gap resolves locally. Fire-and-forget; the current poll is already skipped. */
+const parentAsked = new Set();
+function askParent(trackURI) {
+  if (!trackURI || parentAsked.has(trackURI) || !state.signedIn) return;
+  parentAsked.add(trackURI);
+  worker('/api/parent?track=' + encodeURIComponent(trackURI)).then(r => {
+    if (!r?.uri) return;
+    const albums = DB.get('albums', {});
+    const meta = albums[r.uri] || { totalMs: 0, count: 0, tracks: {} };
+    meta.tracks = meta.tracks || {};
+    if (!meta.tracks[trackURI]) meta.tracks[trackURI] = { o: 0, i: null };
+    albums[r.uri] = meta;
+    DB.set('albums', albums);
+  }).catch(() => {});
+}
 
 /** Every profile we know of: the synced list, plus any owner seen on a bookmark.
     A device that has only just pulled the gist can pick a profile it never typed. */
@@ -522,8 +632,8 @@ function partsEndpoint(uri, allowShow) {
 
 /** Measure across the whole book, or just the part you're on? Defaults by kind;
     the ⋯ menu overrides it for anything Spotify labels ambiguously. */
-const wantsSeries = b =>
-  b.wholeSeries !== undefined ? !!b.wholeSeries : b.kind !== 'episode';
+const wantsSeries = b => b.wholeSeries !== undefined ? !!b.wholeSeries
+  : (b.kind !== 'episode' || isBookSeries(b.albumURI) || looksLikeBookRow(b));
 
 async function fetchContainer(uri) {
   const cache = albumCache();
@@ -632,9 +742,12 @@ function adoptState(remote) {
   if (remote.settings) {
     state.mode = remote.settings.mode || state.mode;
     if (remote.settings.rewindSec != null) DB.set('rewindSec', remote.settings.rewindSec);
-    DB.set('pinnedDevice', remote.settings.pinnedDevice || null);
     DB.set('sleepUntil', remote.settings.sleepUntil || null);
+    // The pinned device is NOT adopted from the server. It describes the machine
+    // you're holding, so syncing it made the phone and the laptop fight over one
+    // value — which is how playback ended up on the MacBook.
   }
+  if (remote.seriesMode) DB.set('seriesMode', remote.seriesMode);
   if (remote.user) {
     DB.set('account', remote.user);
     if (remote.user.market) { marketCache = remote.user.market; DB.set('market', marketCache); }
@@ -664,8 +777,8 @@ async function sync(manual) {
       settings: {
         mode: state.mode,
         rewindSec: DB.get('rewindSec', 15),
-        pinnedDevice: DB.get('pinnedDevice', null),
         defaultProfile: state.profile
+        // pinnedDevice deliberately absent — see below.
       }
     };
     adoptState(await worker('/api/sync', 'POST', payload));
@@ -710,6 +823,16 @@ const deviceIcon = t => DEVICE_ICON[t] || '🎵';
 // "somewhere else in the house" and is never auto-selected.
 const NEAR = new Set(['Smartphone', 'Tablet', 'Computer', 'Automobile']);
 
+/** Which Spotify device type this browser is most likely sitting on. Lets a tap
+    from the phone target the phone even when a laptop is also awake. */
+function platformHint() {
+  const ua = navigator.userAgent || '';
+  if (/iPhone|iPod|Android.*Mobile/.test(ua)) return 'Smartphone';
+  if (/iPad/.test(ua) || (/Macintosh/.test(ua) && (navigator.maxTouchPoints || 0) > 1)) return 'Tablet';
+  if (/Macintosh|Windows|Linux|CrOS/.test(ua)) return 'Computer';
+  return null;
+}
+
 const listDevices = async () =>
   ((await api('/v1/me/player/devices'))?.devices || []).filter(x => x.id);
 
@@ -738,12 +861,20 @@ async function resumeViaWorker(b, label) {
   state.busy = true; render();
   try {
     // Ask the Worker first so it is already waiting, then wake Spotify.
-    const waiting = worker('/api/resume-sync', 'POST',
-      { profile: b.profile || state.profile, key: b.key || b.id });
+    const pinned = DB.get('pinnedDevice');
+    const waiting = worker('/api/resume-sync', 'POST', {
+      profile: b.profile || state.profile,
+      key: b.key || b.id,
+      device: pinned?.id,
+      hint: platformHint()
+    });
     location.href = 'spotify:';
 
     const r = await waiting;
     if (r?.ok) {
+      // Remember what it actually resolved to, so next time is direct — and so a
+      // reinstalled Spotify's new id replaces the stale one automatically.
+      if (r.deviceId) DB.set('pinnedDevice', { id: r.deviceId, name: r.device });
       toast(`Continuing ${label} on ${r.device}`);
       setTimeout(poll, 1500);
     } else if (r?.reason === 'premium_required') {
@@ -822,12 +953,26 @@ const playAlbum = (uri, name) => startPlayback({ context_uri: uri, position_ms: 
     Each carries a different parent field: album, show, audiobook. */
 function describeItem(d) {
   const it = d.item;
-  const parent = it.album || it.show || it.audiobook || null;
+
+  // Audiobook chapters carry spotify:episode: URIs and "type": "episode", so they
+  // look exactly like podcast episodes unless the item has an `audiobook` field —
+  // which Spotify often omits. The playback context is the other tell. Without
+  // this, every chapter became its own bookmark instead of one per book.
+  const contextURI = d.context?.uri || null;
+  const contextKind = (contextURI || '').split(':')[1] || null;
+  const isAudiobook = !!it.audiobook || contextKind === 'audiobook';
+
+  const parent = it.album || it.audiobook || it.show || null;
   const imgs = it.images || parent?.images || [];
-  const people = it.artists || it.authors || [];
-  const kind = it.type === 'chapter' ? 'chapter'
-             : it.type === 'episode' ? (it.audiobook ? 'chapter' : 'episode')
+  const people = it.artists || it.authors || parent?.authors || [];
+
+  const kind = (it.type === 'chapter' || isAudiobook) ? 'chapter'
+             : it.type === 'episode' ? 'episode'
              : 'track';
+
+  // With no parent object, the context is the only handle on the whole work.
+  const groupURI = parent?.uri
+    || (['audiobook', 'show', 'album'].includes(contextKind) ? contextURI : null);
 
   return {
     trackURI: it.uri,
@@ -836,8 +981,8 @@ function describeItem(d) {
     durationMs: it.duration_ms || 0,
     positionMs: d.progress_ms || 0,
     isPlaying: !!d.is_playing,
-    contextURI: d.context?.uri || null,
-    albumURI: parent?.uri || null,
+    contextURI,
+    albumURI: groupURI,
     albumName: parent?.name || it.name,
     artistName: people[0]?.name || parent?.publisher || '',
     artistURI: people[0]?.uri || null,
@@ -851,10 +996,29 @@ function describeItem(d) {
 async function poll() {
   if (!state.signedIn) return;
   try {
-    const d = await api('/v1/me/player?additional_types=episode');
+    const d = await api('/v1/me/player?additional_types=track,episode');
     if (!d || !d.item) { state.nowPlaying = null; return render(); }
 
     state.nowPlaying = describeItem(d);
+
+    // Spotify sometimes omits the parent object on an audiobook chapter, leaving
+    // the chapter title where the book title belongs. The server resolves and
+    // caches the real one.
+    const np0 = state.nowPlaying;
+    if (np0.albumURI && np0.albumName === np0.trackName) {
+      const cache = DB.get('titles', {});
+      if (cache[np0.albumURI]) {
+        Object.assign(np0, { albumName: cache[np0.albumURI].name,
+                             art: np0.art || cache[np0.albumURI].art });
+      } else {
+        worker('/api/title?uri=' + encodeURIComponent(np0.albumURI)).then(t => {
+          if (!t || t.failed) return;
+          cache[np0.albumURI] = t;
+          DB.set('titles', cache);
+          render(true);
+        }).catch(() => {});
+      }
+    }
     const before = state.bookmarks.find(b => b.id === state.profile + '::' +
       (state.nowPlaying.kind === 'episode'
         ? state.nowPlaying.trackURI
@@ -1122,6 +1286,19 @@ function openBookmark(id) {
         <div class="meta"><div class="t1">Jump back to earlier</div>
           <div class="t2">${n} saved position${n === 1 ? '' : 's'}</div></div>
       </div>
+      ${(b.albumURI || '').startsWith('spotify:show:') ? `
+      <div class="row" onclick="markSeries('${esc(b.albumURI)}','${
+          isBookSeries(b.albumURI) ? 'episodes' : 'book'}')">
+        <div class="art">${isBookSeries(b.albumURI) ? '📖' : '🎙'}</div>
+        <div class="meta">
+          <div class="t1">${isBookSeries(b.albumURI)
+            ? 'Treat this series as separate episodes'
+            : 'Treat this series as one book'}</div>
+          <div class="t2">${isBookSeries(b.albumURI)
+            ? 'One bookmark per episode, like a podcast'
+            : 'Spotify serves some audiobooks as podcasts — this merges every chapter into one row'}</div>
+        </div>
+      </div>` : ''}
       <div class="row" onclick="toggleSeries('${esc(b.id)}')">
         <div class="art">${wantsSeries(b) ? '📚' : '🎧'}</div>
         <div class="meta"><div class="t1">Measure progress ${wantsSeries(b) ? 'across the whole book' : 'in this part only'}</div>
@@ -1152,6 +1329,27 @@ function toggleSeries(id) {
   save();
   if (b.wholeSeries) warmAlbums();
   openBookmark(id);
+}
+
+/** Spotify gives no way to tell an audiobook-served-as-a-show from a real
+    podcast, so this records the listener's decision and folds the per-episode
+    rows it already created into one. */
+async function markSeries(uri, mode) {
+  closeSheet();
+  state.busy = true; render();
+  try {
+    const r = await worker('/api/series-mode', 'POST', { uri, mode });
+    adoptState(r);
+    autoArchive();
+    render(true);
+    toast(mode === 'book'
+      ? (r.merged ? `Merged ${r.merged} chapter rows into one book` : 'Now tracked as one book')
+      : 'Now tracked per episode');
+  } catch (e) {
+    toast(e.message || 'Could not change that.', true);
+  } finally {
+    state.busy = false; render();
+  }
 }
 
 function toggleArchive(id) {
@@ -1403,6 +1601,26 @@ function openSettings() {
       ? 'Only artists, albums and keywords on your watchlist get bookmarked.'
       : 'Every album you play gets a bookmark. Tap ✕ on a row to forget it.'}</p>
 
+    <h2>Version</h2>
+    <div class="card">
+      <div class="row" style="cursor:default">
+        <div class="art">📱</div>
+        <div class="meta"><div class="t1">${esc(BUILD)}</div>
+          <div class="t2">this device — stale means a cached page</div></div>
+      </div>
+      <div class="row" style="cursor:default">
+        <div class="art">☁️</div>
+        <div class="meta"><div class="t1" id="worker-build">checking…</div>
+          <div class="t2">your server — stale means the deploy didn't land</div></div>
+      </div>
+    </div>
+    <p class="hint">Both should match what you last published. They carry separate
+       version numbers because they ship separately — the app to GitHub, the server
+       with <b>wrangler deploy</b>.</p>
+    <div class="center">
+      <button class="ghost" onclick="hardReload()">Force refresh this device</button>
+    </div>
+
     <h2>Storage</h2>
     <p class="hint">Everything lives on your server, so a Safari data purge costs nothing —
        sign in again and it all comes back. Chapter lists are cached on this device for
@@ -1413,8 +1631,23 @@ function openSettings() {
     </div>
 
     <div style="margin-top:22px"><button class="primary" style="background:#3a1f1f;color:#ffb4b4" onclick="signOut();closeSheet()">Sign out of Spotify</button></div>`;
+
+  checkWorkerBuild();
 }
 function setMode(m) { state.mode = m; save(); openSettings(); }
+
+/** Fills in the server's build once Settings is open, so one screen answers
+    "is each half actually running what I published?". */
+function checkWorkerBuild() {
+  const show = text => {
+    const el = document.getElementById('worker-build');
+    if (el) el.textContent = text;
+  };
+  fetch(WORKER + '/health')
+    .then(r => r.json())
+    .then(h => show(h.build || 'older than build markers'))
+    .catch(() => show('unreachable'));
+}
 
 /* ── Sleep timer ──────────────────────────────────────────────
    Prevention, where "Jump back to earlier" is the cure. The server holds the
@@ -1585,11 +1818,16 @@ function drawDevices(list) {
       <button class="ghost" onclick="openDevices()">Refresh</button>
       <button class="ghost" onclick="location.href='spotify:'">Open Spotify here</button>
     </div>
+    <p class="hint"><b>This choice is remembered on this device only.</b> Your phone and
+       your laptop each keep their own, so a tap here never changes where the other
+       one plays.</p>
     <p class="hint">Pinning is strict — playback only ever goes there, and you're told
-       if it's asleep rather than audio quietly landing in another room.</p>
-    <p class="hint">On automatic, a phone or computer always wins. A speaker is only
-       used after about 13 seconds of waiting for something handheld, because an Echo
-       is always online and would otherwise beat a phone that's still launching.</p>`;
+       if it's asleep rather than audio quietly landing in another room. If Spotify is
+       reinstalled and the id changes, it re-learns the new one by itself.</p>
+    <p class="hint">On automatic, this browser targets its own kind first: a tap from
+       the phone goes to the phone even when a laptop is awake. Speakers are only used
+       after about 13 seconds of waiting, since an always-on Echo would otherwise beat
+       a phone that's still launching.</p>`;
 }
 
 function pinDevice(id, name) {
@@ -1601,8 +1839,7 @@ function pinDevice(id, name) {
     DB.set('pinnedDevice', { id, name });
     toast('Every resume will go to ' + name);
   }
-  scheduleSync();
-  openDevices();
+  openDevices();     // local only; nothing to sync
 }
 
 /** Hand current playback to another device without restarting it. With nothing
@@ -1619,7 +1856,8 @@ async function moveTo(id, name) {
       const b = mine().find(x => !x.archived);
       if (!b) { toast('Nothing saved to play yet.', true); return; }
       const r = await worker('/api/resume-sync', 'POST',
-        { profile: b.profile || state.profile, key: b.key || b.id, device: id });
+        { profile: b.profile || state.profile, key: b.key || b.id,
+          device: id, hint: platformHint() });
       toast(r?.ok ? `Continuing ${b.albumName} on ${name}` : `${name} didn't respond.`, !r?.ok);
       setTimeout(poll, 1500);
     }
