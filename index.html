@@ -147,12 +147,21 @@
    The redirect URI is this page's own URL; register it verbatim
    in the Spotify dashboard.
    ════════════════════════════════════════════════════════════ */
-const WORKER = 'https://contilisten.YOURNAME.workers.dev';   // no trailing slash
+/* Your Worker's address. Set it once in the app and it is kept in this browser,
+   so replacing this file with a newer version never wipes it — paste the URL
+   below only if you prefer to hard-code it. */
+const WORKER_DEFAULT = 'https://contilisten.YOURNAME.workers.dev';   // no trailing slash
+
+function workerBase() {
+  const saved = (() => { try { return localStorage.getItem('workerUrl'); } catch (e) { return null; } })();
+  return (saved || WORKER_DEFAULT || '').replace(/\/+$/, '');
+}
+const workerConfigured = () => !!workerBase() && !workerBase().includes('YOURNAME');
 
 // Shown in Settings. iOS caches Home Screen web apps aggressively, so this is
 // how you tell at a glance whether the page you are looking at is the one you
 // last published.
-const BUILD = 'app-2026-10-25.2';
+const BUILD = 'app-2026-10-25.3';
 
 /* ── Crash guard ──────────────────────────────────────────────
    Anything thrown before render() used to leave a blank black page with no
@@ -329,10 +338,21 @@ function toast(msg, warn, action) {
 const session = () => DB.get('session');
 
 function signIn() {
-  if (WORKER.includes('YOURNAME')) {
-    return toast('Set WORKER at the top of index.html first.', true);
-  }
-  location.href = WORKER + '/auth/login';
+  if (!workerConfigured()) return askWorkerUrl();
+  location.href = workerBase() + '/auth/login';
+}
+
+/** Asked once, kept in this browser. Replacing index.html no longer wipes it. */
+function askWorkerUrl() {
+  const current = workerBase().includes('YOURNAME') ? '' : workerBase();
+  const entered = prompt(
+    'Address of your ContiListen server\n\n'
+    + 'Looks like https://contilisten.yourname.workers.dev', current);
+  if (entered === null) return;
+  const url = entered.trim().replace(/\/+$/, '');
+  if (!/^https:\/\/.+/.test(url)) return toast('That needs to start with https://', true);
+  try { localStorage.setItem('workerUrl', url); } catch (e) {}
+  location.replace(location.origin + location.pathname);
 }
 
 /** The Worker sends the session back in the URL fragment after login. */
@@ -361,7 +381,7 @@ async function worker(path, method = 'GET', body) {
   const token = session();
   if (!token) throw new Error('NOT_SIGNED_IN');
 
-  const res = await fetch(WORKER + path, {
+  const res = await fetch(workerBase() + path, {
     method,
     headers: {
       Authorization: 'Bearer ' + token,
@@ -392,7 +412,7 @@ async function api(path, method = 'GET', body) {
   const token = session();
   if (!token) throw new Error('NOT_SIGNED_IN');
 
-  const r = await fetch(WORKER + '/api/spotify' + path, {
+  const r = await fetch(workerBase() + '/api/spotify' + path, {
     method,
     headers: {
       Authorization: 'Bearer ' + token,
@@ -1165,11 +1185,12 @@ function render(force) {
   if (!state.signedIn) {
     app.innerHTML = `
       <div class="signin">
-        <div class="mark">🎧</div>
+        <div class="mark">${workerConfigured() ? '🎧' : '🔌'}</div>
         <h3>Pick up where you stopped</h3>
         <p>Spotify only remembers your position in podcasts.
            ContiListen keeps a bookmark for Hörspiele and audiobooks too.</p>
-        <button class="primary" onclick="signIn()">Sign in with Spotify</button>
+        <button class="primary" onclick="${workerConfigured() ? 'signIn()' : 'askWorkerUrl()'}">${
+          workerConfigured() ? 'Sign in with Spotify' : 'Connect to your server'}</button>
         <p style="font-size:12.5px;margin-top:18px">Your Spotify login is held by your
            own server, never by this device.</p>
       </div>`;
@@ -1613,6 +1634,12 @@ function openSettings() {
         <div class="meta"><div class="t1" id="worker-build">checking…</div>
           <div class="t2">your server — stale means the deploy didn't land</div></div>
       </div>
+      <div class="row" onclick="askWorkerUrl()">
+        <div class="art">🔌</div>
+        <div class="meta"><div class="t1" style="font-size:13px;word-break:break-all">${
+          esc(workerBase())}</div>
+          <div class="t2">server address — tap to change</div></div>
+      </div>
     </div>
     <p class="hint">Both should match what you last published. They carry separate
        version numbers because they ship separately — the app to GitHub, the server
@@ -1643,7 +1670,7 @@ function checkWorkerBuild() {
     const el = document.getElementById('worker-build');
     if (el) el.textContent = text;
   };
-  fetch(WORKER + '/health')
+  fetch(workerBase() + '/health')
     .then(r => r.json())
     .then(h => show(h.build || 'older than build markers'))
     .catch(() => show('unreachable'));
@@ -1692,7 +1719,7 @@ function openShortcut() {
     if (sheet().open && refreshSheet === openShortcut) openShortcut();
   }).catch(() => {});
   const url = account.shortcutKey
-    ? `${WORKER}/resume?key=${account.shortcutKey}&profile=${encodeURIComponent(state.profile)}`
+    ? `${workerBase()}/resume?key=${account.shortcutKey}&profile=${encodeURIComponent(state.profile)}`
     : null;
 
   openSheet('Siri & Shortcuts', openShortcut);
